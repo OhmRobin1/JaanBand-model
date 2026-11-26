@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-obsidian-950: #040709;
+  --color-obsidian-900: #070b0e;
+  --color-obsidian-850: #0c1217;
+  --color-obsidian-800: #111920;
+  --color-obsidian-700: #1b2530;
+  --color-emeraldGlow: #00e599;
+  --color-titaniumGold: #e3a72f;
+}
+
+@layer base {
+  :root {
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: #040709;
+    color: #f1f5f9;
+    font-family: var(--font-sans);
+    padding-top: var(--safe-top);
+    padding-bottom: var(--safe-bottom);
+  }
+}
+
+.glass-panel {
+  background: rgba(12, 18, 23, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glow-emerald {
+  box-shadow: 0 0 24px -4px rgba(0, 229, 153, 0.28);
+}
+
+.glow-gold {
+  box-shadow: 0 0 20px -3px rgba(227, 167, 47, 0.25);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

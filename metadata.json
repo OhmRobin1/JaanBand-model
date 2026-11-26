@@ -1,0 +1,6 @@
+{
+  "name": "JaanBand Core MK-IV",
+  "description": "Interactive 3D executive presentation and live biometric telemetry showcase for JaanBand Core MK-IV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
