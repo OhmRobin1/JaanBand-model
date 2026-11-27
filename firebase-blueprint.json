@@ -1,0 +1,232 @@
+{
+  "entities": {
+    "Worker": {
+      "title": "Worker",
+      "description": "A site worker registered in JaanShield and paired to a physical JaanBand Core MK-IV biometric wristband.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Worker identifier (e.g. W01)",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Full display name of the worker",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "role": {
+          "type": "string",
+          "description": "On-site job role (e.g. Mason, Welder)",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "bandId": {
+          "type": "string",
+          "description": "Paired JaanBand hardware identifier (empty if unpaired)",
+          "maxLength": 48,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "baselineHr": {
+          "type": "number",
+          "description": "Resting baseline heart rate in BPM (40-140)"
+        },
+        "loadFactor": {
+          "type": "number",
+          "description": "Physical workload multiplier (0.1-2.0)"
+        },
+        "condition": {
+          "type": "string",
+          "description": "Latest evaluated physiological condition",
+          "enum": ["unlinked", "normal", "caution", "critical"]
+        },
+        "reasons": {
+          "type": "array",
+          "description": "Threshold evaluation explanations (1-10 items)"
+        },
+        "lastReport": {
+          "type": "object",
+          "description": "Most recent telemetry report snapshot or null"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the operator managing this worker",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "role",
+        "bandId",
+        "baselineHr",
+        "loadFactor",
+        "condition",
+        "reasons",
+        "lastReport",
+        "ownerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TelemetryReport": {
+      "title": "TelemetryReport",
+      "description": "A single real-time biometric packet transmitted from a paired JaanBand Core MK-IV.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique telemetry report ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "workerId": {
+          "type": "string",
+          "description": "Parent worker identifier",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bandId": {
+          "type": "string",
+          "description": "Transmitting JaanBand identifier",
+          "minLength": 1,
+          "maxLength": 48,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "bpm": {
+          "type": "number",
+          "description": "Measured heart rate in BPM (25-240)"
+        },
+        "spo2": {
+          "type": "number",
+          "description": "Blood oxygen saturation percentage (50-100)"
+        },
+        "skinTempC": {
+          "type": "number",
+          "description": "Sub-epidermal skin temperature in Celsius (25-45)"
+        },
+        "hrvMs": {
+          "type": "number",
+          "description": "Heart rate variability in milliseconds (0-300) or null"
+        },
+        "heatIndexC": {
+          "type": "number",
+          "description": "Ambient heat index in Celsius (-20-75) or null"
+        },
+        "perfusionIndex": {
+          "type": "number",
+          "description": "Optical perfusion index percentage (0-25) or null"
+        },
+        "batteryPct": {
+          "type": "number",
+          "description": "Band battery charge percentage (0-100) or null"
+        },
+        "minutesSinceBreak": {
+          "type": "number",
+          "description": "Continuous shift duration since last rest break (0-1440)"
+        },
+        "condition": {
+          "type": "string",
+          "description": "Computed physiological risk classification",
+          "enum": ["normal", "caution", "critical"]
+        },
+        "reasons": {
+          "type": "array",
+          "description": "Triggered threshold alerts (1-10 items)"
+        },
+        "source": {
+          "type": "string",
+          "description": "Telemetry transport origin",
+          "enum": ["ble", "api", "manual"]
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the managing operator",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 telemetry measurement timestamp",
+          "minLength": 10,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Firestore server ingestion timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "workerId",
+        "bandId",
+        "bpm",
+        "spo2",
+        "skinTempC",
+        "minutesSinceBreak",
+        "condition",
+        "reasons",
+        "source",
+        "ownerUid",
+        "timestamp",
+        "createdAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Server-provisioned site administrator allowlist record.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 160
+        }
+      },
+      "required": ["uid"]
+    }
+  },
+  "firestore": {
+    "/workers/{workerId}": {
+      "schema": {
+        "$ref": "#/entities/Worker"
+      },
+      "description": "Primary worker roster and active JaanBand pairing + latest biometric state."
+    },
+    "/workers/{workerId}/telemetry/{reportId}": {
+      "schema": {
+        "$ref": "#/entities/TelemetryReport"
+      },
+      "description": "Append-only time-series biometric packets emitted by each worker's paired JaanBand."
+    },
+    "/admins/{adminId}": {
+      "schema": {
+        "$ref": "#/entities/AdminRecord"
+      },
+      "description": "Explicit site administrator UIDs authorized across all worker cohorts."
+    }
+  }
+}

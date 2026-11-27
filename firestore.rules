@@ -1,0 +1,233 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Security Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn()
+        && isEmailVerified()
+        && request.auth.token.email == 'dancerohmrobin@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin()
+        || (isSignedIn() && isEmailVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isOwner(ownerUid) {
+      return isSignedIn() && isEmailVerified() && request.auth.uid == ownerUid;
+    }
+
+    // 3. Validation Blueprints
+    function isValidReasons(reasons) {
+      return reasons is list
+        && reasons.size() >= 1
+        && reasons.size() <= 10
+        && reasons[0] is string
+        && reasons[0].size() >= 1
+        && reasons[0].size() <= 160;
+    }
+
+    function isValidReportSnapshot(rep) {
+      return rep is map
+        && rep.keys().hasAll([
+          'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
+          'minutesSinceBreak', 'condition', 'reasons', 'source', 'timestamp'
+        ])
+        && rep.keys().hasOnly([
+          'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
+          'hrvMs', 'heatIndexC', 'perfusionIndex', 'batteryPct',
+          'minutesSinceBreak', 'condition', 'reasons', 'source', 'timestamp'
+        ])
+        && isValidId(rep.id)
+        && isValidId(rep.workerId)
+        && rep.bandId is string && rep.bandId.size() >= 1 && rep.bandId.size() <= 48 && rep.bandId.matches('^[a-zA-Z0-9_\\-]+$')
+        && rep.bpm is number && rep.bpm >= 25 && rep.bpm <= 240
+        && rep.spo2 is number && rep.spo2 >= 50 && rep.spo2 <= 100
+        && rep.skinTempC is number && rep.skinTempC >= 25 && rep.skinTempC <= 45
+        && (!('hrvMs' in rep) || rep.hrvMs == null || (rep.hrvMs is number && rep.hrvMs >= 0 && rep.hrvMs <= 300))
+        && (!('heatIndexC' in rep) || rep.heatIndexC == null || (rep.heatIndexC is number && rep.heatIndexC >= -20 && rep.heatIndexC <= 75))
+        && (!('perfusionIndex' in rep) || rep.perfusionIndex == null || (rep.perfusionIndex is number && rep.perfusionIndex >= 0 && rep.perfusionIndex <= 25))
+        && (!('batteryPct' in rep) || rep.batteryPct == null || (rep.batteryPct is number && rep.batteryPct >= 0 && rep.batteryPct <= 100))
+        && rep.minutesSinceBreak is number && rep.minutesSinceBreak >= 0 && rep.minutesSinceBreak <= 1440
+        && rep.condition in ['normal', 'caution', 'critical']
+        && isValidReasons(rep.reasons)
+        && rep.source in ['ble', 'api', 'manual']
+        && rep.timestamp is string && rep.timestamp.size() >= 10 && rep.timestamp.size() <= 40;
+    }
+
+    function isValidWorker(data) {
+      return data.keys().hasAll([
+        'id', 'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
+        'condition', 'reasons', 'lastReport', 'ownerUid', 'createdAt', 'updatedAt'
+      ])
+      && data.keys().hasOnly([
+        'id', 'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
+        'condition', 'reasons', 'lastReport', 'ownerUid', 'createdAt', 'updatedAt'
+      ])
+      && isValidId(data.id)
+      && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+      && data.role is string && data.role.size() >= 1 && data.role.size() <= 60
+      && data.bandId is string && data.bandId.size() <= 48 && (data.bandId == '' || data.bandId.matches('^[a-zA-Z0-9_\\-]+$'))
+      && data.baselineHr is number && data.baselineHr >= 40 && data.baselineHr <= 140
+      && data.loadFactor is number && data.loadFactor >= 0.1 && data.loadFactor <= 2.0
+      && data.condition in ['unlinked', 'normal', 'caution', 'critical']
+      && isValidReasons(data.reasons)
+      && (data.lastReport == null || isValidReportSnapshot(data.lastReport))
+      && data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128
+      && data.createdAt is timestamp
+      && data.updatedAt is timestamp;
+    }
+
+    function isValidTelemetryReport(data, parentWorkerId) {
+      return data.keys().hasAll([
+        'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
+        'minutesSinceBreak', 'condition', 'reasons', 'source',
+        'ownerUid', 'timestamp', 'createdAt'
+      ])
+      && data.keys().hasOnly([
+        'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
+        'hrvMs', 'heatIndexC', 'perfusionIndex', 'batteryPct',
+        'minutesSinceBreak', 'condition', 'reasons', 'source',
+        'ownerUid', 'timestamp', 'createdAt'
+      ])
+      && isValidId(data.id)
+      && data.workerId == parentWorkerId
+      && isValidId(data.workerId)
+      && data.bandId is string && data.bandId.size() >= 1 && data.bandId.size() <= 48 && data.bandId.matches('^[a-zA-Z0-9_\\-]+$')
+      && data.bpm is number && data.bpm >= 25 && data.bpm <= 240
+      && data.spo2 is number && data.spo2 >= 50 && data.spo2 <= 100
+      && data.skinTempC is number && data.skinTempC >= 25 && data.skinTempC <= 45
+      && (!('hrvMs' in data) || data.hrvMs == null || (data.hrvMs is number && data.hrvMs >= 0 && data.hrvMs <= 300))
+      && (!('heatIndexC' in data) || data.heatIndexC == null || (data.heatIndexC is number && data.heatIndexC >= -20 && data.heatIndexC <= 75))
+      && (!('perfusionIndex' in data) || data.perfusionIndex == null || (data.perfusionIndex is number && data.perfusionIndex >= 0 && data.perfusionIndex <= 25))
+      && (!('batteryPct' in data) || data.batteryPct == null || (data.batteryPct is number && data.batteryPct >= 0 && data.batteryPct <= 100))
+      && data.minutesSinceBreak is number && data.minutesSinceBreak >= 0 && data.minutesSinceBreak <= 1440
+      && data.condition in ['normal', 'caution', 'critical']
+      && isValidReasons(data.reasons)
+      && data.source in ['ble', 'api', 'manual']
+      && data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128
+      && data.timestamp is string && data.timestamp.size() >= 10 && data.timestamp.size() <= 40
+      && data.createdAt is timestamp;
+    }
+
+    // 4. Collection Rules
+    match /test/connection {
+      allow get: if isSignedIn();
+      allow list, write: if false;
+    }
+
+    match /admins/{adminId} {
+      allow get: if isSignedIn()
+        && isEmailVerified()
+        && isValidId(adminId)
+        && (request.auth.uid == adminId || isBootstrappedAdmin());
+      allow list, write: if false;
+    }
+
+    match /workers/{workerId} {
+      allow get: if isSignedIn()
+        && isEmailVerified()
+        && isValidId(workerId)
+        && (isOwner(existing().ownerUid) || isAdmin());
+
+      allow list: if isSignedIn()
+        && isEmailVerified()
+        && (resource.data.ownerUid == request.auth.uid || isAdmin());
+
+      allow create: if isSignedIn()
+        && isEmailVerified()
+        && isValidId(workerId)
+        && isValidWorker(incoming())
+        && incoming().id == workerId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn()
+        && isEmailVerified()
+        && isValidId(workerId)
+        && isValidWorker(incoming())
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (isOwner(existing().ownerUid) || isAdmin())
+        && (
+          // Action: Update worker metadata or pair/unpair JaanBand
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'role', 'bandId', 'baselineHr', 'loadFactor', 'condition', 'reasons', 'updatedAt'
+          ])
+          ||
+          // Action: Record latest live band telemetry state
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'bandId', 'condition', 'reasons', 'lastReport', 'updatedAt'
+          ])
+          ||
+          isAdmin()
+        );
+
+      allow delete: if isSignedIn()
+        && isEmailVerified()
+        && isValidId(workerId)
+        && (isOwner(existing().ownerUid) || isAdmin());
+
+      match /telemetry/{reportId} {
+        allow get: if isSignedIn()
+          && isEmailVerified()
+          && isValidId(workerId)
+          && isValidId(reportId)
+          && (isOwner(existing().ownerUid) || isAdmin())
+          && exists(/databases/$(database)/documents/workers/$(workerId));
+
+        allow list: if isSignedIn()
+          && isEmailVerified()
+          && (resource.data.ownerUid == request.auth.uid || isAdmin());
+
+        allow create: if isSignedIn()
+          && isEmailVerified()
+          && isValidId(workerId)
+          && isValidId(reportId)
+          && isValidTelemetryReport(incoming(), workerId)
+          && incoming().id == reportId
+          && incoming().createdAt == request.time
+          && (incoming().ownerUid == request.auth.uid || isAdmin())
+          && exists(/databases/$(database)/documents/workers/$(workerId))
+          && get(/databases/$(database)/documents/workers/$(workerId)).data.ownerUid == incoming().ownerUid
+          && getAfter(/databases/$(database)/documents/workers/$(workerId)).data.updatedAt == request.time;
+
+        allow update: if false;
+
+        allow delete: if isSignedIn()
+          && isEmailVerified()
+          && isValidId(workerId)
+          && isValidId(reportId)
+          && (isOwner(existing().ownerUid) || isAdmin());
+      }
+    }
+  }
+}

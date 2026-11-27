@@ -12,14 +12,20 @@ import {
   Touchpad,
   View,
 } from 'lucide-react';
-import { CameraPreset, FinishOption, SafetyScenario } from '../types/band';
+import {
+  CameraPreset,
+  ConditionLevel,
+  FinishOption,
+  WorkerRecord,
+} from '../types/band';
 
 interface BandViewport3DProps {
   finish: FinishOption;
-  bpm: number;
-  skinTempC: number;
-  scenario: SafetyScenario;
-  isStreaming: boolean;
+  worker: WorkerRecord | null;
+  condition: ConditionLevel;
+  bpm: number | null;
+  skinTempC: number | null;
+  isConnectedStream: boolean;
   isDiagnosing: boolean;
   exploded: boolean;
   onToggleExploded: () => void;
@@ -55,10 +61,11 @@ function detectSoftwareWebGL(): boolean {
 
 export function BandViewport3D({
   finish,
+  worker,
+  condition,
   bpm,
   skinTempC,
-  scenario,
-  isStreaming,
+  isConnectedStream,
   isDiagnosing,
   exploded,
   onToggleExploded,
@@ -71,10 +78,11 @@ export function BandViewport3D({
 
   const stateRef = useRef({
     finish,
+    worker,
+    condition,
     bpm,
     skinTempC,
-    scenario,
-    isStreaming,
+    isConnectedStream,
     isDiagnosing,
     exploded,
     autoOrbit,
@@ -83,10 +91,11 @@ export function BandViewport3D({
   });
 
   stateRef.current.finish = finish;
+  stateRef.current.worker = worker;
+  stateRef.current.condition = condition;
   stateRef.current.bpm = bpm;
   stateRef.current.skinTempC = skinTempC;
-  stateRef.current.scenario = scenario;
-  stateRef.current.isStreaming = isStreaming;
+  stateRef.current.isConnectedStream = isConnectedStream;
   stateRef.current.isDiagnosing = isDiagnosing;
   stateRef.current.exploded = exploded;
   stateRef.current.autoOrbit = autoOrbit;
@@ -376,7 +385,6 @@ export function BandViewport3D({
       bevelThickness: 0.028,
     });
     coreCaseGeo.center();
-    coreCaseGeo.computeTangents();
 
     const chassisMat = new THREE.MeshPhysicalMaterial({
       color: finish.chassisColor,
@@ -409,83 +417,105 @@ export function BandViewport3D({
     const updateOled = (elapsed: number) => {
       if (!dCtx) return;
       const {
+        worker: curWorker,
+        condition: curCondition,
         bpm: curBpm,
         skinTempC: curTemp,
-        scenario: curScenario,
-        isStreaming: streaming,
+        isConnectedStream: streamUp,
         isDiagnosing: diagnosing,
         finish: curFinish,
       } = stateRef.current;
 
-      const isHeat = curScenario === 'heat_stress';
-      const isFatigue = curScenario === 'fatigue';
+      const hasReport = curBpm !== null && curTemp !== null;
+      const isCritical = curCondition === 'critical';
+      const isCaution = curCondition === 'caution';
       const signalColor = diagnosing
         ? '#38bdf8'
-        : isHeat
-          ? '#f97316'
-          : isFatigue
-            ? '#e3a72f'
-            : '#00e599';
+        : !hasReport
+          ? '#94a3b8'
+          : isCritical
+            ? '#f97316'
+            : isCaution
+              ? '#e3a72f'
+              : '#00e599';
 
       dCtx.fillStyle = '#04070a';
       dCtx.fillRect(0, 0, 512, 256);
 
-      // Hairline frame
-      dCtx.strokeStyle = isHeat
-        ? 'rgba(249,115,22,0.45)'
-        : isFatigue
-          ? 'rgba(227,167,47,0.4)'
+      dCtx.strokeStyle = isCritical
+        ? 'rgba(249,115,22,0.5)'
+        : isCaution
+          ? 'rgba(227,167,47,0.45)'
           : 'rgba(255,255,255,0.08)';
       dCtx.lineWidth = 2;
       dCtx.strokeRect(10, 10, 492, 236);
 
-      // Header row
-      dCtx.fillStyle = isHeat || isFatigue ? signalColor : curFinish.accentHex;
+      const headerTitle = diagnosing
+        ? 'DIAGNOSTIC SCAN'
+        : curWorker
+          ? `${curWorker.id} • ${curWorker.bandId || 'UNPAIRED'}`
+          : 'JAANBAND MK-IV';
+
+      dCtx.fillStyle = hasReport || diagnosing ? signalColor : curFinish.accentHex;
       dCtx.font = 'bold 20px "JetBrains Mono", monospace';
-      dCtx.fillText(
-        diagnosing
-          ? 'DIAGNOSTIC SCAN'
-          : isHeat
-            ? 'HEAT STRESS ALERT'
-            : isFatigue
-              ? 'FATIGUE RISK'
-              : 'JAANSHIELD CORE',
-        28,
-        44,
-      );
+      dCtx.fillText(headerTitle.slice(0, 22), 28, 44);
 
-      dCtx.fillStyle = '#94a3b8';
+      const statusBadge = !curWorker
+        ? 'UNLINKED'
+        : !hasReport
+          ? 'AWAITING'
+          : isCritical
+            ? 'CRITICAL'
+            : isCaution
+              ? 'CAUTION'
+              : streamUp
+                ? 'LIVE OK'
+                : 'SYNCED';
+
+      dCtx.fillStyle = hasReport ? signalColor : '#94a3b8';
       dCtx.font = '18px "JetBrains Mono", monospace';
-      dCtx.fillText(streaming ? '100HZ LIVE' : 'STANDBY', 376, 44);
+      dCtx.fillText(statusBadge, 378, 44);
 
-      // ECG / Arterial trace
+      // ECG / Arterial trace (flat line if awaiting real report)
       dCtx.strokeStyle = signalColor;
-      dCtx.lineWidth = 5;
+      dCtx.lineWidth = hasReport ? 5 : 2.5;
       dCtx.beginPath();
-      const waveY = 148;
+      const waveY = 144;
       for (let i = 0; i <= 80; i++) {
         const u = i / 80;
         const x = 28 + u * 456;
-        const phase = streaming ? (u * 2.1 - elapsed * (curBpm / 60)) % 1 : u * 2.1;
-        const cyc = phase < 0 ? phase + 1 : phase;
-        const spike =
-          Math.exp(-Math.pow((cyc - 0.35) / 0.025, 2)) * -58 +
-          Math.exp(-Math.pow((cyc - 0.42) / 0.03, 2)) * 28 -
-          Math.exp(-Math.pow((cyc - 0.56) / 0.055, 2)) * 16;
-        const y = waveY + spike;
+        let y = waveY;
+        if (hasReport) {
+          const phase = (u * 2.1 - elapsed * (curBpm / 60)) % 1;
+          const cyc = phase < 0 ? phase + 1 : phase;
+          const spike =
+            Math.exp(-Math.pow((cyc - 0.35) / 0.025, 2)) * -56 +
+            Math.exp(-Math.pow((cyc - 0.42) / 0.03, 2)) * 26 -
+            Math.exp(-Math.pow((cyc - 0.56) / 0.055, 2)) * 15;
+          y = waveY + spike;
+        }
         if (i === 0) dCtx.moveTo(x, y);
         else dCtx.lineTo(x, y);
       }
       dCtx.stroke();
 
-      // Numeric BPM + Skin Temp
-      dCtx.fillStyle = '#f8fafc';
-      dCtx.font = 'bold 48px "Plus Jakarta Sans", sans-serif';
-      dCtx.fillText(String(curBpm), 28, 220);
+      if (hasReport) {
+        dCtx.fillStyle = '#f8fafc';
+        dCtx.font = 'bold 48px "Plus Jakarta Sans", sans-serif';
+        dCtx.fillText(String(curBpm), 28, 220);
 
-      dCtx.fillStyle = signalColor;
-      dCtx.font = 'bold 20px "JetBrains Mono", monospace';
-      dCtx.fillText(`BPM  •  ${curTemp.toFixed(1)}°C`, 112, 215);
+        dCtx.fillStyle = signalColor;
+        dCtx.font = 'bold 20px "JetBrains Mono", monospace';
+        dCtx.fillText(`BPM  •  ${curTemp.toFixed(1)}°C`, 114, 215);
+      } else {
+        dCtx.fillStyle = '#e2e8f0';
+        dCtx.font = 'bold 22px "Plus Jakarta Sans", sans-serif';
+        dCtx.fillText(
+          curWorker ? 'Awaiting real band report' : 'Pair worker band to stream',
+          28,
+          216,
+        );
+      }
 
       displayTex.needsUpdate = true;
     };
@@ -662,17 +692,27 @@ export function BandViewport3D({
       }
       bandGroup.position.y = Math.sin(elapsed * 1.4) * 0.045;
 
-      // Pulse underside PPG optical sensor
-      const pulseSpeed = cur.isDiagnosing ? 8.5 : (cur.bpm / 60) * Math.PI * 2;
-      const pulse = cur.isStreaming ? (Math.sin(elapsed * pulseSpeed) + 1) * 0.5 : 0.2;
+      // Pulse underside PPG optical sensor when real telemetry or diagnostic scan is active
+      const hasReport = cur.bpm !== null && cur.bpm > 0;
+      const pulseSpeed = cur.isDiagnosing
+        ? 8.5
+        : hasReport
+          ? ((cur.bpm as number) / 60) * Math.PI * 2
+          : 0;
+      const pulse =
+        cur.isDiagnosing || hasReport ? (Math.sin(elapsed * pulseSpeed) + 1) * 0.5 : 0.08;
       const hue = cur.isDiagnosing
         ? 0.54
-        : cur.scenario === 'heat_stress'
-          ? 0.06
-          : cur.scenario === 'fatigue'
+        : cur.condition === 'critical'
+          ? 0.05
+          : cur.condition === 'caution'
             ? 0.11
             : 0.43;
-      sensorGlowMat.color.setHSL(hue, 1.0, 0.34 + pulse * 0.26);
+      sensorGlowMat.color.setHSL(
+        hue,
+        hasReport || cur.isDiagnosing ? 1.0 : 0.25,
+        0.22 + pulse * 0.34,
+      );
 
       // Update OLED texture at ~15fps
       if (elapsed - lastOledUpdate > 0.066) {

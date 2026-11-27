@@ -70,16 +70,65 @@ export const FINISH_OPTIONS: FinishOption[] = [
   },
 ];
 
-export type SafetyScenario = 'baseline' | 'heat_stress' | 'fatigue';
+export type ConditionLevel = 'unlinked' | 'normal' | 'caution' | 'critical';
 
-export interface TelemetryReading {
+export type TelemetrySource = 'ble' | 'api' | 'manual';
+
+export interface ThresholdConfig {
+  hrY: number;
+  hrR: number;
+  spY: number;
+  spR: number;
+  tY: number;
+  tR: number;
+  hiY: number;
+  hiR: number;
+  brk: number;
+}
+
+export const DEFAULT_THRESHOLDS: ThresholdConfig = {
+  hrY: 115,
+  hrR: 140,
+  spY: 94,
+  spR: 90,
+  tY: 35.5,
+  tR: 37.0,
+  hiY: 32.0,
+  hiR: 41.0,
+  brk: 150,
+};
+
+export interface TelemetryReport {
+  id: string;
+  workerId: string;
+  bandId: string;
   bpm: number;
-  hrvMs: number;
   spo2: number;
   skinTempC: number;
-  perfusionIndex: number;
-  batteryPct: number;
-  heatIndexC: number;
+  hrvMs: number | null;
+  heatIndexC: number | null;
+  perfusionIndex: number | null;
+  batteryPct: number | null;
+  minutesSinceBreak: number;
+  condition: Exclude<ConditionLevel, 'unlinked'>;
+  reasons: string[];
+  source: TelemetrySource;
+  timestamp: string;
+}
+
+export interface WorkerRecord {
+  id: string;
+  name: string;
+  role: string;
+  bandId: string;
+  baselineHr: number;
+  loadFactor: number;
+  condition: ConditionLevel;
+  reasons: string[];
+  lastReport: TelemetryReport | null;
+  history?: TelemetryReport[];
+  ownerUid?: string;
+  updatedAt: string;
 }
 
 export interface DiagnosticCheckItem {

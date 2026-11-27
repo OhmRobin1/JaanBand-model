@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   Activity,
   BatteryCharging,
@@ -8,112 +9,80 @@ import {
   HeartPulse,
   Infinity as InfinityIcon,
   Layers,
+  LogIn,
+  LogOut,
   Scale,
   Share2,
   Shield,
   Thermometer,
   Waves,
 } from 'lucide-react';
+import { BandIngestControls } from './components/BandIngestControls';
 import { BandViewport3D } from './components/BandViewport3D';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
 import { LiveTelemetryWave } from './components/LiveTelemetryWave';
+import { WorkerRosterPanel } from './components/WorkerRosterPanel';
 import {
+  auth,
+  firebaseConfig,
+  signInWithGoogle,
+  signOutUser,
+  testConnection,
+} from './firebase';
+import { subscribeWorkers } from './services/jaanshieldFirestore';
+import {
+  ConditionLevel,
   DiagnosticCheckItem,
   FINISH_OPTIONS,
   FinishId,
-  SafetyScenario,
-  TelemetryReading,
+  WorkerRecord,
 } from './types/band';
 
 const INITIAL_CHECKS: DiagnosticCheckItem[] = [
   {
-    id: 'ppg',
-    label: 'Dual-Wavelength PPG Array',
-    detail: '530nm green + 940nm IR optical SNR lock',
-    metric: '42.8 dB SNR',
+    id: 'firestore',
+    label: 'Shared Firebase Firestore Link',
+    detail: 'Real-time onSnapshot & Google Auth session check',
+    metric: 'CONNECTED',
     status: 'pending',
   },
   {
-    id: 'spo2',
-    label: 'Clinical SpO2 Calibration',
-    detail: 'Arterial oxygen saturation curve alignment',
-    metric: '99.4% LOCK',
+    id: 'ppg',
+    label: 'Dual-Wavelength PPG Array',
+    detail: '530nm green + 940nm IR optical calibration',
+    metric: '42.8 dB SNR',
     status: 'pending',
   },
   {
     id: 'thermal',
     label: 'Sub-Epidermal Thermistor',
-    detail: 'Heat-stress ±0.05°C circadian drift check',
+    detail: 'Heat-stress ±0.05°C baseline alignment',
     metric: '±0.02 °C',
     status: 'pending',
   },
   {
     id: 'cipher',
-    label: 'JaanShield Telemetry Link',
-    detail: 'AES-256-GCM early risk alert handshake',
+    label: 'Jaan-Cipher Telemetry Link',
+    detail: 'Worker-to-band binding integrity check',
     metric: 'VERIFIED',
     status: 'pending',
   },
 ];
 
-const SCENARIO_PRESETS: Record<
-  SafetyScenario,
-  {
-    label: string;
-    bpmRange: [number, number];
-    hrvRange: [number, number];
-    tempRange: [number, number];
-    spo2: number;
-    heatIndexC: number;
-    alertSummary: string;
-  }
-> = {
-  baseline: {
-    label: 'Baseline Shift',
-    bpmRange: [68, 76],
-    hrvRange: [64, 74],
-    tempRange: [36.6, 36.8],
-    spo2: 99.4,
-    heatIndexC: 31.2,
-    alertSummary: 'Normal thermal & cardiovascular load',
-  },
-  heat_stress: {
-    label: 'Heat Stress',
-    bpmRange: [128, 138],
-    hrvRange: [28, 35],
-    tempRange: [38.2, 38.6],
-    spo2: 97.6,
-    heatIndexC: 42.8,
-    alertSummary: 'Early heat strain alert dispatched to JaanShield',
-  },
-  fatigue: {
-    label: 'Fatigue Risk',
-    bpmRange: [94, 104],
-    hrvRange: [34, 42],
-    tempRange: [37.4, 37.7],
-    spo2: 98.2,
-    heatIndexC: 36.5,
-    alertSummary: 'Elevated strain & HRV drop — break recommended',
-  },
-};
-
 export default function App() {
   const [selectedFinishId, setSelectedFinishId] = useState<FinishId>('obsidian');
-  const [scenario, setScenario] = useState<SafetyScenario>('baseline');
-  const [isStreaming, setIsStreaming] = useState(true);
   const [exploded, setExploded] = useState(false);
   const [activeWaveMode, setActiveWaveMode] = useState<'ppg' | 'thermal'>('ppg');
   const [copiedSpec, setCopiedSpec] = useState(false);
 
-  const [telemetry, setTelemetry] = useState<TelemetryReading>({
-    bpm: 72,
-    hrvMs: 68,
-    spo2: 99.4,
-    skinTempC: 36.7,
-    perfusionIndex: 4.2,
-    batteryPct: 94,
-    heatIndexC: 31.2,
-  });
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const [workers, setWorkers] = useState<WorkerRecord[]>([]);
+  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
+  const [isStreamConnected, setIsStreamConnected] = useState(false);
+  const [firestoreError, setFirestoreError] = useState<Error | null>(null);
 
   const [showDiagnostic, setShowDiagnostic] = useState(false);
   const [isDiagnosing, setIsDiagnosing] = useState(false);
@@ -123,72 +92,96 @@ export default function App() {
     null,
   );
 
+  // Throw Firestore permission/runtime errors into ErrorBoundary cleanly
+  if (firestoreError) {
+    throw firestoreError;
+  }
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
+      setUser(nextUser);
+      setAuthReady(true);
+      if (!nextUser) {
+        setWorkers([]);
+        setSelectedWorkerId(null);
+        setIsStreamConnected(false);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || !user) return;
+
+    const unsubscribe = subscribeWorkers(
+      user,
+      (list) => {
+        setWorkers(list);
+        setSelectedWorkerId((prev) =>
+          prev && list.some((w) => w.id === prev) ? prev : list[0]?.id ?? null,
+        );
+        setIsStreamConnected(true);
+      },
+      (err) => {
+        setIsStreamConnected(false);
+        setFirestoreError(err);
+      },
+    );
+
+    return () => unsubscribe();
+  }, [authReady, user]);
+
+  const handleSignIn = useCallback(async () => {
+    setAuthError(null);
+    try {
+      await signInWithGoogle();
+    } catch (err) {
+      setAuthError(
+        err instanceof Error ? err.message : 'Google Sign-In cancelled or blocked',
+      );
+    }
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    setAuthError(null);
+    await signOutUser();
+  }, []);
+
   const selectedFinish = useMemo(
     () => FINISH_OPTIONS.find((f) => f.id === selectedFinishId) ?? FINISH_OPTIONS[0],
     [selectedFinishId],
   );
 
-  // Immediately align telemetry values when switching worker safety scenario
-  const handleSelectScenario = (nextScenario: SafetyScenario) => {
-    setScenario(nextScenario);
-    const preset = SCENARIO_PRESETS[nextScenario];
-    setTelemetry((prev) => ({
-      ...prev,
-      bpm: Math.round((preset.bpmRange[0] + preset.bpmRange[1]) / 2),
-      hrvMs: Math.round((preset.hrvRange[0] + preset.hrvRange[1]) / 2),
-      skinTempC: Number(((preset.tempRange[0] + preset.tempRange[1]) / 2).toFixed(1)),
-      spo2: preset.spo2,
-      heatIndexC: preset.heatIndexC,
-    }));
-  };
+  const selectedWorker = useMemo(
+    () => workers.find((w) => w.id === selectedWorkerId) ?? workers[0] ?? null,
+    [workers, selectedWorkerId],
+  );
 
-  // Subtle realistic live biometric telemetry jitter when stream is active
-  useEffect(() => {
-    if (!isStreaming) return;
-    const preset = SCENARIO_PRESETS[scenario];
-    const timer = window.setInterval(() => {
-      setTelemetry((prev) => {
-        const bpmDelta = Math.round((Math.random() - 0.5) * 3);
-        const nextBpm = Math.min(
-          preset.bpmRange[1],
-          Math.max(preset.bpmRange[0], prev.bpm + bpmDelta),
-        );
-        const nextHrv = Math.min(
-          preset.hrvRange[1],
-          Math.max(preset.hrvRange[0], prev.hrvMs + Math.round((Math.random() - 0.5) * 3)),
-        );
-        const nextTemp = Number(
-          Math.min(
-            preset.tempRange[1],
-            Math.max(preset.tempRange[0], prev.skinTempC + (Math.random() - 0.5) * 0.06),
-          ).toFixed(2),
-        );
-        return {
-          ...prev,
-          bpm: nextBpm,
-          hrvMs: nextHrv,
-          skinTempC: nextTemp,
-        };
-      });
-    }, 1600);
+  const latestReport = selectedWorker?.lastReport ?? null;
+  const activeCondition: ConditionLevel = selectedWorker?.condition ?? 'unlinked';
 
-    return () => window.clearInterval(timer);
-  }, [isStreaming, scenario]);
-
-  const runDiagnosticSequence = useCallback(() => {
+  const runDiagnosticSequence = useCallback(async () => {
     setShowDiagnostic(true);
     setIsDiagnosing(true);
     setDiagnosticCompletedAt(null);
-    setIsStreaming(true);
 
-    const fresh = INITIAL_CHECKS.map((item, idx) => ({
+    const reachable = await testConnection();
+    const pairedCount = workers.filter((w) => Boolean(w.bandId)).length;
+    const healthMetric = !reachable
+      ? 'OFFLINE'
+      : user
+        ? `${pairedCount} PAIRED · FIRESTORE LIVE`
+        : 'REACHABLE · SIGN IN';
+
+    const checksWithHealth = INITIAL_CHECKS.map((item, idx) => ({
       ...item,
+      metric: idx === 0 ? healthMetric : item.metric,
       status: idx === 0 ? ('running' as const) : ('pending' as const),
     }));
-    setDiagnosticChecks(fresh);
+    setDiagnosticChecks(checksWithHealth);
 
-    const stepDelay = 520;
-    INITIAL_CHECKS.forEach((_, stepIndex) => {
+    const stepDelay = 480;
+    checksWithHealth.forEach((_, stepIndex) => {
       window.setTimeout(() => {
         setDiagnosticChecks((prev) =>
           prev.map((item, idx) => {
@@ -198,7 +191,7 @@ export default function App() {
           }),
         );
 
-        if (stepIndex === INITIAL_CHECKS.length - 1) {
+        if (stepIndex === checksWithHealth.length - 1) {
           setIsDiagnosing(false);
           setDiagnosticCompletedAt(
             new Date().toLocaleTimeString([], {
@@ -210,10 +203,13 @@ export default function App() {
         }
       }, (stepIndex + 1) * stepDelay);
     });
-  }, []);
+  }, [user, workers]);
 
   const handleShareSpec = useCallback(async () => {
-    const summary = `JaanBand Core MK-IV for JaanShield — ${selectedFinish.name} | 14-Day Endurance | 100M / 10ATM | 21.4g | ${telemetry.spo2.toFixed(1)}% SpO2 | Live BPM: ${telemetry.bpm} | https://jaan-shield.vercel.app`;
+    const workerSummary = selectedWorker
+      ? `Worker ${selectedWorker.id} (${selectedWorker.name}) · Band ${selectedWorker.bandId} · Condition: ${activeCondition.toUpperCase()}`
+      : 'No worker paired';
+    const summary = `JaanBand Core MK-IV · ${selectedFinish.name} · ${workerSummary} · Firestore Project: ${firebaseConfig.projectId} (${firebaseConfig.firestoreDatabaseId})`;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(summary);
@@ -223,15 +219,13 @@ export default function App() {
     }
     setCopiedSpec(true);
     window.setTimeout(() => setCopiedSpec(false), 2200);
-  }, [selectedFinish.name, telemetry.bpm, telemetry.spo2]);
-
-  const activeScenarioMeta = SCENARIO_PRESETS[scenario];
+  }, [activeCondition, selectedFinish.name, selectedWorker]);
 
   return (
     <div className="min-h-screen bg-[#040709] text-slate-100 pb-10">
       {/* Executive Top Bar */}
       <header className="sticky top-0 z-40 bg-[#040709]/92 backdrop-blur-xl border-b border-white/5">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-emeraldGlow/20 via-obsidian-850 to-titaniumGold/20 border border-emeraldGlow/30 flex items-center justify-center shrink-0">
               <InfinityIcon className="w-[18px] h-[18px] text-emeraldGlow" aria-hidden="true" />
@@ -246,35 +240,64 @@ export default function App() {
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 font-medium tracking-tight truncate">
-                JaanShield Worker Safety Hardware
+                JaanShield Shared Firestore Telemetry
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => setIsStreaming((prev) => !prev)}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full border text-[10px] font-mono tracking-wide font-semibold whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                isStreaming
+            <div
+              className={`${
+                isStreamConnected ? 'inline-flex' : 'hidden sm:inline-flex'
+              } items-center gap-1.5 px-2.5 py-1.5 rounded-full border text-[10px] font-mono tracking-wide font-semibold whitespace-nowrap shrink-0 ${
+                isStreamConnected
                   ? 'bg-emeraldGlow/10 border-emeraldGlow/30 text-emeraldGlow'
-                  : 'bg-obsidian-800 border-white/10 text-slate-400 hover:text-slate-200'
+                  : 'bg-obsidian-800 border-white/10 text-slate-400'
               }`}
-              aria-pressed={isStreaming}
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full ${
-                  isStreaming ? 'bg-emeraldGlow animate-pulse' : 'bg-slate-500'
+                  isStreamConnected ? 'bg-emeraldGlow animate-pulse' : 'bg-slate-500'
                 }`}
               />
-              <span>{isStreaming ? 'LIVE SENSOR STREAM' : 'STREAM PAUSED'}</span>
-            </button>
+              <span>
+                {isStreamConnected
+                  ? 'FIRESTORE LIVE'
+                  : user
+                    ? 'SYNCING'
+                    : 'SIGN IN TO SYNC'}
+              </span>
+            </div>
+
+            {user ? (
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full bg-obsidian-800 border border-white/10 text-[11px] font-medium text-slate-200 hover:text-orange-300 hover:border-orange-500/30 transition-colors cursor-pointer"
+                title={`Signed in as ${user.email || user.uid}`}
+              >
+                <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+                <span className="hidden sm:inline max-w-[120px] truncate">
+                  {user.email?.split('@')[0] || 'Sign out'}
+                </span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={!authReady}
+                onClick={handleSignIn}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emeraldGlow text-obsidian-950 text-[11px] font-semibold hover:brightness-105 disabled:opacity-60 transition cursor-pointer whitespace-nowrap"
+              >
+                <LogIn className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Google Sign-In</span>
+              </button>
+            )}
 
             <a
               href="https://jaan-shield.vercel.app"
               target="_blank"
               rel="noopener noreferrer"
-              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-obsidian-800 border border-white/10 text-[11px] font-medium text-slate-200 hover:text-emeraldGlow hover:border-emeraldGlow/30 transition-colors whitespace-nowrap shrink-0"
+              className="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-obsidian-800 border border-white/10 text-[11px] font-medium text-slate-200 hover:text-emeraldGlow hover:border-emeraldGlow/30 transition-colors whitespace-nowrap shrink-0"
             >
               <span>JaanShield Monitor</span>
               <ExternalLink className="w-3 h-3" aria-hidden="true" />
@@ -284,7 +307,7 @@ export default function App() {
               type="button"
               onClick={handleShareSpec}
               className="h-9 px-2.5 rounded-full bg-obsidian-800 border border-white/10 flex items-center justify-center gap-1.5 text-slate-300 hover:text-white hover:border-white/20 transition-colors cursor-pointer"
-              aria-label="Copy specification summary"
+              aria-label="Copy live link summary"
             >
               {copiedSpec ? (
                 <>
@@ -301,18 +324,27 @@ export default function App() {
         </div>
       </header>
 
+      {authError && (
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-3">
+          <div className="p-2.5 rounded-xl bg-orange-500/10 border border-orange-500/30 text-xs text-orange-300">
+            {authError}
+          </div>
+        </div>
+      )}
+
       {/* Main Executive Stage */}
       <main className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 lg:pt-6">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-6 items-start">
-          {/* Left Column: 3D Studio Viewport + Key Performance Metrics */}
+          {/* Left Column: 3D Studio Viewport + Key Performance Metrics + Worker-Band Registry */}
           <div className="lg:col-span-6 space-y-4">
             <section className="relative rounded-3xl overflow-hidden glass-panel border border-white/10 shadow-2xl">
               <BandViewport3D
                 finish={selectedFinish}
-                bpm={telemetry.bpm}
-                skinTempC={telemetry.skinTempC}
-                scenario={scenario}
-                isStreaming={isStreaming}
+                worker={selectedWorker}
+                condition={activeCondition}
+                bpm={latestReport?.bpm ?? null}
+                skinTempC={latestReport?.skinTempC ?? null}
+                isConnectedStream={isStreamConnected}
                 isDiagnosing={isDiagnosing}
                 exploded={exploded}
                 onToggleExploded={() => setExploded((prev) => !prev)}
@@ -416,92 +448,98 @@ export default function App() {
                 <p className="text-[10px] text-slate-400 mt-0.5">Zero wrist fatigue</p>
               </div>
             </section>
+
+            {/* Worker-Band Registry (Real Firestore Workers Only — Zero Dummy Data) */}
+            <WorkerRosterPanel
+              user={user}
+              authReady={authReady}
+              onSignIn={handleSignIn}
+              workers={workers}
+              selectedWorkerId={selectedWorker?.id ?? null}
+              onSelectWorker={setSelectedWorkerId}
+            />
           </div>
 
-          {/* Right Column: Biometric Sensor Array, Industrial Architecture & Diagnostic Deck */}
+          {/* Right Column: Live Worker Band Condition, Real-Time Transfer & Architecture */}
           <div className="lg:col-span-6 space-y-4">
-            {/* Biometric Sensor Array Deep Dive */}
+            {/* Biometric Sensor Array & Selected Worker Condition */}
             <section className="glass-panel p-4 rounded-3xl border border-white/10 space-y-3">
-              <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
                 <div className="flex items-center gap-2">
                   <Activity className="w-4 h-4 text-emeraldGlow" aria-hidden="true" />
                   <h3 className="text-xs font-mono font-bold tracking-wider uppercase text-white">
-                    Biometric Sensor Array
+                    {selectedWorker
+                      ? `${selectedWorker.id} · ${selectedWorker.name}`
+                      : 'Biometric Sensor Array'}
                   </h3>
                 </div>
-                <span className="text-[10px] font-mono tabular-nums text-emeraldGlow px-2 py-0.5 rounded bg-emeraldGlow/10 border border-emeraldGlow/20 whitespace-nowrap">
-                  {telemetry.spo2.toFixed(1)}% Clinical SpO2
+                <span
+                  className={`text-[10px] font-mono tabular-nums px-2 py-0.5 rounded bg-obsidian-950 border whitespace-nowrap ${
+                    activeCondition === 'critical'
+                      ? 'text-orange-400 border-orange-500/40'
+                      : activeCondition === 'caution'
+                        ? 'text-titaniumGold border-titaniumGold/40'
+                        : activeCondition === 'normal'
+                          ? 'text-emeraldGlow border-emeraldGlow/30'
+                          : 'text-slate-400 border-white/10'
+                  }`}
+                >
+                  {latestReport
+                    ? `${latestReport.spo2.toFixed(1)}% SpO2 · ${activeCondition.toUpperCase()}`
+                    : 'Awaiting Band Report'}
                 </span>
               </div>
 
-              {/* JaanShield Worksite Risk Simulation Switcher */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
-                  <span>JAANSHIELD WORKSITE SIMULATION</span>
-                  <span
-                    className={
-                      scenario === 'heat_stress'
-                        ? 'text-orange-400'
-                        : scenario === 'fatigue'
-                          ? 'text-titaniumGold'
-                          : 'text-emeraldGlow'
-                    }
-                  >
-                    Heat Index {telemetry.heatIndexC.toFixed(1)}°C
-                  </span>
+              {/* Real Condition Reasons from Firestore */}
+              {selectedWorker && (
+                <div className="p-2.5 rounded-xl bg-obsidian-950/85 border border-white/5 text-[11px] space-y-1">
+                  <div className="flex items-center justify-between font-mono text-slate-400">
+                    <span>Paired Band: {selectedWorker.bandId || 'Unpaired'}</span>
+                    <span>
+                      {latestReport
+                        ? `Last report ${new Date(latestReport.timestamp).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })} (${latestReport.source.toUpperCase()})`
+                        : 'No packets received yet'}
+                    </span>
+                  </div>
+                  <p className="text-slate-200">
+                    {selectedWorker.reasons.join(' · ')}
+                  </p>
                 </div>
-                <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-obsidian-950/90 border border-white/5">
-                  {(Object.keys(SCENARIO_PRESETS) as SafetyScenario[]).map((key) => {
-                    const isActive = scenario === key;
-                    return (
-                      <button
-                        key={key}
-                        type="button"
-                        onClick={() => handleSelectScenario(key)}
-                        className={`px-2 py-1.5 rounded-lg text-[11px] font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                          isActive
-                            ? key === 'heat_stress'
-                              ? 'bg-orange-500/20 text-orange-300 border border-orange-500/40'
-                              : key === 'fatigue'
-                                ? 'bg-titaniumGold/20 text-titaniumGold border border-titaniumGold/40'
-                                : 'bg-emeraldGlow/15 text-emeraldGlow border border-emeraldGlow/35'
-                            : 'text-slate-400 hover:text-slate-200 border border-transparent'
-                        }`}
-                      >
-                        {SCENARIO_PRESETS[key].label}
-                      </button>
-                    );
-                  })}
-                </div>
-                <p className="text-[11px] text-slate-400 px-1">
-                  {activeScenarioMeta.alertSummary}
-                </p>
-              </div>
+              )}
 
-              {/* Live Waveform Strip + Telemetry Readouts */}
+              {/* Live Waveform Strip + Real Telemetry Readouts */}
               <div className="space-y-2">
                 <LiveTelemetryWave
-                  bpm={telemetry.bpm}
-                  isStreaming={isStreaming}
+                  bpm={latestReport?.bpm ?? null}
+                  condition={activeCondition}
                   isDiagnosing={isDiagnosing}
                   mode={activeWaveMode}
-                  scenario={scenario}
                 />
                 <div className="flex items-center justify-between px-1 text-[11px] font-mono tabular-nums text-slate-400">
                   <span>
                     HR:{' '}
-                    <strong className="text-white font-semibold">{telemetry.bpm} BPM</strong>
+                    <strong className="text-white font-semibold">
+                      {latestReport ? `${latestReport.bpm} BPM` : '--'}
+                    </strong>
                   </span>
                   <span>
                     HRV:{' '}
                     <strong className="text-emeraldGlow font-semibold">
-                      {telemetry.hrvMs} ms
+                      {latestReport?.hrvMs !== null && latestReport?.hrvMs !== undefined
+                        ? `${latestReport.hrvMs} ms`
+                        : '--'}
                     </strong>
                   </span>
                   <span>
-                    PI:{' '}
+                    Heat Index:{' '}
                     <strong className="text-slate-200 font-semibold">
-                      {telemetry.perfusionIndex.toFixed(1)}%
+                      {latestReport?.heatIndexC !== null && latestReport?.heatIndexC !== undefined
+                        ? `${latestReport.heatIndexC.toFixed(1)}°C`
+                        : '--'}
                     </strong>
                   </span>
                 </div>
@@ -531,7 +569,7 @@ export default function App() {
                     </div>
                   </div>
                   <span className="text-[10px] font-mono text-emeraldGlow font-medium px-1.5 py-0.5 bg-obsidian-950 rounded whitespace-nowrap shrink-0">
-                    {isStreaming ? 'ACTIVE' : 'PAUSED'}
+                    {latestReport ? `${latestReport.bpm} BPM` : 'IDLE'}
                   </span>
                 </button>
 
@@ -558,11 +596,18 @@ export default function App() {
                     </div>
                   </div>
                   <span className="text-[10px] font-mono tabular-nums text-titaniumGold font-medium px-1.5 py-0.5 bg-obsidian-950 rounded whitespace-nowrap shrink-0">
-                    {telemetry.skinTempC.toFixed(1)}°C
+                    {latestReport ? `${latestReport.skinTempC.toFixed(1)}°C` : '--°C'}
                   </span>
                 </button>
               </div>
             </section>
+
+            {/* Real-Time Band Transfer Controls (Web Bluetooth + Firestore Batch + JaanShield Config) */}
+            <BandIngestControls
+              user={user}
+              selectedWorker={selectedWorker}
+              isStreamConnected={isStreamConnected}
+            />
 
             {/* Industrial Design & Craftsmanship */}
             <section className="glass-panel p-4 rounded-3xl border border-white/10 space-y-3">
@@ -615,7 +660,6 @@ export default function App() {
               </div>
             </section>
 
-            {/* Optional Live Diagnostic Panel */}
             {showDiagnostic && (
               <DiagnosticPanel
                 checks={diagnosticChecks}
@@ -638,7 +682,7 @@ export default function App() {
                   <Activity className="w-[18px] h-[18px]" aria-hidden="true" />
                   <span>
                     {isDiagnosing
-                      ? 'Calibrating Biometric Array...'
+                      ? 'Verifying Firestore & Sensor Array...'
                       : 'Run Diagnostic Telemetry Check'}
                   </span>
                 </button>
@@ -658,7 +702,7 @@ export default function App() {
                 <span>FIRMWARE: v4.2.1-JAANSHIELD</span>
                 <span className="text-emeraldGlow flex items-center gap-1">
                   <Shield className="w-3 h-3" aria-hidden="true" />
-                  ENCRYPTED VIA JAAN-CIPHER
+                  SHARED FIRESTORE SYNC READY
                 </span>
               </div>
             </div>
