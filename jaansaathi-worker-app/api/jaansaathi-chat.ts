@@ -98,19 +98,67 @@ Language: ${languageName} (${nativeScript})
 ${formattedHistory ? `Recent private chat:\n${formattedHistory}\n` : ''}
 Message: "${message}"`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: checkInResponseSchema,
-      },
-    });
+    const attempts: Array<{
+      model: string;
+      useLowThinking: boolean;
+      timeoutMs: number;
+      delayMs: number;
+    }> = [
+      { model: 'gemini-4-hydrogen', useLowThinking: true, timeoutMs: 4500, delayMs: 0 },
+      { model: 'gemini-3.1-flash-lite', useLowThinking: false, timeoutMs: 4500, delayMs: 150 },
+    ];
 
-    if (!response.text) throw new Error('Empty Gemini response');
-    const parsed = JSON.parse(response.text) as Record<string, unknown>;
+    let text: string | undefined;
+    let lastError: unknown = null;
+
+    for (const attempt of attempts) {
+      if (attempt.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+      }
+      try {
+        const config: Record<string, unknown> = {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: checkInResponseSchema,
+        };
+        if (attempt.useLowThinking) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model: attempt.model,
+            contents: userPrompt,
+            config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Model response timed out')), attempt.timeoutMs),
+          ),
+        ]);
+
+        if (response.text) {
+          text = response.text;
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient =
+          msg.includes('503') ||
+          msg.includes('429') ||
+          msg.includes('UNAVAILABLE') ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('timed out');
+        if (!isTransient) break;
+      }
+    }
+
+    if (!text) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('JaanSaathi AI service is temporarily busy. Please try again.');
+    }
+    const parsed = JSON.parse(text) as Record<string, unknown>;
     const rawMood = String(parsed.buddyMood || 'warm');
     const rawStrain = String(parsed.mentalStrainLevel || 'calm');
     const rawBoost = Number(parsed.mentalRfBoost);
@@ -129,8 +177,11 @@ Message: "${message}"`;
       gentleCareTip: sanitizeInput(parsed.gentleCareTip, 350),
     });
   } catch (err) {
-    res.status(502).json({
-      error: err instanceof Error ? err.message : 'JaanSaathi AI service unavailable',
-    });
+    const rawMsg = err instanceof Error ? err.message : 'JaanSaathi AI service unavailable';
+    const friendlyMsg =
+      rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE')
+        ? 'JaanSaathi AI is experiencing a brief traffic spike. Please tap Send again in a few seconds.'
+        : rawMsg;
+    res.status(502).json({ error: friendlyMsg });
   }
 }

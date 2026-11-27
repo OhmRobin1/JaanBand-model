@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   Check,
@@ -90,6 +90,10 @@ export default function App() {
   const [careTip, setCareTip] = useState<string | null>(null);
   const [buddyMood, setBuddyMood] = useState<BuddyMood>('warm');
   const [buddyMessage, setBuddyMessage] = useState('');
+  const [localTurns, setLocalTurns] = useState<
+    Array<{ role: 'worker' | 'buddy'; text: string }>
+  >([]);
+  const lastCheckinIdRef = useRef<string | null>(null);
   const [speechEnabled, setSpeechEnabled] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [copiedUid, setCopiedUid] = useState(false);
@@ -116,6 +120,7 @@ export default function App() {
       setVault(null);
       setCheckins([]);
       setAssignedWorkers([]);
+      lastCheckinIdRef.current = null;
       return;
     }
 
@@ -129,7 +134,8 @@ export default function App() {
       },
       (list) => {
         setCheckins(list);
-        if (list.length > 0) {
+        if (list.length > 0 && lastCheckinIdRef.current !== list[0].id) {
+          lastCheckinIdRef.current = list[0].id;
           setBuddyMessage(list[0].buddyReply);
           setBuddyMood(list[0].buddyMood);
           setCareTip(list[0].gentleCareTip || null);
@@ -151,12 +157,12 @@ export default function App() {
   }, [authReady, user]);
 
   useEffect(() => {
-    if (checkins.length === 0) {
+    if (checkins.length === 0 && localTurns.length === 0) {
       setBuddyMessage(currentLanguage.greeting);
       setBuddyMood('warm');
       setCareTip(null);
     }
-  }, [currentLanguage, checkins.length]);
+  }, [currentLanguage, checkins.length, localTurns.length]);
 
   const speakText = useCallback((text: string, locale: string) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window) || !text) return;
@@ -206,13 +212,16 @@ export default function App() {
     setBuddyMood('listening');
 
     try {
-      const historyPayload = checkins
-        .slice(0, 4)
-        .reverse()
-        .flatMap((c) => [
-          { role: 'worker', text: c.workerMessage },
-          { role: 'buddy', text: c.buddyReply },
-        ]);
+      const historyPayload =
+        checkins.length > 0
+          ? checkins
+              .slice(0, 4)
+              .reverse()
+              .flatMap((c) => [
+                { role: 'worker', text: c.workerMessage },
+                { role: 'buddy', text: c.buddyReply },
+              ])
+          : localTurns.slice(-6);
 
       const resp = await fetch('/api/jaansaathi-chat', {
         method: 'POST',
@@ -231,9 +240,19 @@ export default function App() {
         }),
       });
 
-      const data = (await resp.json()) as Record<string, unknown>;
+      const rawText = await resp.text();
+      let data: Record<string, unknown> = {};
+      try {
+        data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+      } catch {
+        data = {};
+      }
       if (!resp.ok) {
-        throw new Error(typeof data.error === 'string' ? data.error : 'AI check-in failed');
+        throw new Error(
+          typeof data.error === 'string'
+            ? data.error
+            : `AI check-in failed (HTTP ${resp.status})`,
+        );
       }
 
       const reply = String(data.replyInLanguage || currentLanguage.greeting);
@@ -246,6 +265,11 @@ export default function App() {
       setBuddyMood(nextMood);
       setCareTip(tip || null);
       setMessageInput('');
+      setLocalTurns((prev) => [
+        ...prev.slice(-6),
+        { role: 'worker', text: rawMsg },
+        { role: 'buddy', text: reply },
+      ]);
 
       if (speechEnabled) speakText(reply, currentLanguage.speechLocale);
 
@@ -263,6 +287,8 @@ export default function App() {
           gentleCareTip: tip,
           recommendShadedDuty: Boolean(data.recommendShadedDuty),
           recommendMedicalHold: Boolean(data.recommendMedicalHold),
+        }).catch((err) => {
+          setErrorMsg(err instanceof Error ? err.message : 'Vault sync delayed.');
         });
       }
     } catch (err) {
@@ -297,6 +323,29 @@ export default function App() {
     rec.onerror = () => setIsListening(false);
     rec.onend = () => setIsListening(false);
     rec.start();
+  };
+
+  const handleSignIn = async () => {
+    setErrorMsg(null);
+    try {
+      await signInWithGoogle();
+    } catch (err) {
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (code === 'auth/unauthorized-domain') {
+        setErrorMsg(
+          `Domain "${window.location.hostname}" is not authorized in Firebase Console -> Authentication -> Settings -> Authorized domains.`,
+        );
+      } else if (code === 'auth/popup-blocked') {
+        setErrorMsg(
+          'Google Sign-In popup was blocked. Allow popups for this site and try again.',
+        );
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : 'Google Sign-In failed.');
+      }
+    }
   };
 
   const handleCopyUid = async () => {
@@ -352,7 +401,7 @@ export default function App() {
             <button
               type="button"
               disabled={!authReady}
-              onClick={() => void signInWithGoogle()}
+              onClick={() => void handleSignIn()}
               className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-emeraldGlow text-obsidian-950 text-[11px] font-semibold cursor-pointer"
             >
               <LogIn className="w-3.5 h-3.5" />

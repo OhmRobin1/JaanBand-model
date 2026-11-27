@@ -323,20 +323,28 @@ export async function saveCheckinAndSyncAnonymized(
     createdAt: serverTimestamp(),
   });
 
+  await batch.commit();
+
   if (params.worker) {
     const computed = computeCombinedThresholds(params.worker, strain, boost);
-    batch.update(doc(db, 'workers', params.worker.id), {
-      mentalStrainLevel: strain,
-      mentalRfBoost: boost,
-      mentalAdjustedAt: new Date().toISOString(),
-      fitStatus: computed.fitStatus,
-      fitReasons: computed.fitReasons,
-      riskFactor: computed.riskFactor,
-      dynamicHrY: computed.dynamicHrY,
-      dynamicHrR: computed.dynamicHrR,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await setDoc(
+        doc(db, 'workers', params.worker.id),
+        {
+          mentalStrainLevel: strain,
+          mentalRfBoost: boost,
+          mentalAdjustedAt: new Date().toISOString(),
+          fitStatus: computed.fitStatus,
+          fitReasons: computed.fitReasons,
+          riskFactor: computed.riskFactor,
+          dynamicHrY: computed.dynamicHrY,
+          dynamicHrR: computed.dynamicHrR,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+    } catch {
+      // Non-fatal if worker profile isn't linked yet
+    }
   }
-
-  await batch.commit();
 }

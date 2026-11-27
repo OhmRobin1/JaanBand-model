@@ -127,20 +127,65 @@ Selected language: ${languageName} (${nativeScript})
 ${formattedHistory ? `Recent private conversation:\n${formattedHistory}\n` : ''}
 Latest worker message: "${message}"`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: checkInResponseSchema,
-      },
-    });
+    const attempts: Array<{
+      model: string;
+      useLowThinking: boolean;
+      timeoutMs: number;
+      delayMs: number;
+    }> = [
+      { model: 'gemini-4-hydrogen', useLowThinking: true, timeoutMs: 5500, delayMs: 0 },
+      { model: 'gemini-3.1-flash-lite', useLowThinking: false, timeoutMs: 6000, delayMs: 200 },
+    ];
 
-    const text = response.text;
+    let text: string | undefined;
+    let lastError: unknown = null;
+
+    for (const attempt of attempts) {
+      if (attempt.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+      }
+      try {
+        const config: Record<string, unknown> = {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: checkInResponseSchema,
+        };
+        if (attempt.useLowThinking) {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+
+        const response = await Promise.race([
+          ai.models.generateContent({
+            model: attempt.model,
+            contents: userPrompt,
+            config,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Model response timed out')), attempt.timeoutMs),
+          ),
+        ]);
+
+        if (response.text) {
+          text = response.text;
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient =
+          msg.includes('503') ||
+          msg.includes('429') ||
+          msg.includes('UNAVAILABLE') ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('timed out');
+        if (!isTransient) break;
+      }
+    }
+
     if (!text) {
-      throw new Error('Empty response from Gemini API.');
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('JaanSaathi AI service is temporarily busy. Please try again in a moment.');
     }
 
     const parsed = JSON.parse(text) as Record<string, unknown>;
@@ -163,12 +208,15 @@ Latest worker message: "${message}"`;
     });
   } catch (err) {
     console.error('JaanSaathi Gemini API error:', err);
-    res.status(502).json({
-      error:
-        err instanceof Error
-          ? err.message
-          : 'Could not reach JaanSaathi AI service right now.',
-    });
+    const rawMsg =
+      err instanceof Error ? err.message : 'Could not reach JaanSaathi AI service right now.';
+    const friendlyMsg =
+      rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE')
+        ? 'JaanSaathi AI is experiencing a brief traffic spike. Please tap Send again in a few seconds.'
+        : rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')
+          ? 'JaanSaathi AI rate limit reached temporarily. Please wait a moment and try again.'
+          : rawMsg;
+    res.status(502).json({ error: friendlyMsg });
   }
 });
 

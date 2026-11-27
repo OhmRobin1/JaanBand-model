@@ -2236,6 +2236,16 @@ export async function recordPrivateCheckinAndSyncAnonymizedRf(
     createdAt: serverTimestamp(),
   });
 
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.WRITE,
+      `worker_private/${user.uid}/checkins/${checkinId}`,
+    );
+  }
+
   if (params.worker) {
     const w = params.worker;
     const dyn = computeDynamicRiskProfile({
@@ -2272,26 +2282,24 @@ export async function recordPrivateCheckinAndSyncAnonymizedRf(
 
     const workerRef = doc(db, 'workers', w.id);
     // Anonymized update ONLY: zero private words or health disclosures sent to workers/{id}
-    batch.update(workerRef, {
-      mentalStrainLevel: strain,
-      mentalRfBoost: effectiveBoost,
-      mentalAdjustedAt: new Date().toISOString(),
-      fitStatus: fit.status,
-      fitReasons: fit.reasons.map((r) => sanitizeText(r, 160)).filter(Boolean).slice(0, 10),
-      riskFactor: dyn.riskFactor,
-      dynamicHrY: dyn.thresholds.hrY,
-      dynamicHrR: dyn.thresholds.hrR,
-      updatedAt: serverTimestamp(),
-    });
-  }
-
-  try {
-    await batch.commit();
-  } catch (error) {
-    handleFirestoreError(
-      error,
-      OperationType.WRITE,
-      `worker_private/${user.uid}/checkins/${checkinId}`,
-    );
+    try {
+      await setDoc(
+        workerRef,
+        {
+          mentalStrainLevel: strain,
+          mentalRfBoost: effectiveBoost,
+          mentalAdjustedAt: new Date().toISOString(),
+          fitStatus: fit.status,
+          fitReasons: fit.reasons.map((r) => sanitizeText(r, 160)).filter(Boolean).slice(0, 10),
+          riskFactor: dyn.riskFactor,
+          dynamicHrY: dyn.thresholds.hrY,
+          dynamicHrR: dyn.thresholds.hrR,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      );
+    } catch {
+      // Non-fatal if worker profile isn't paired via workerUid yet; private checkin is still safely saved
+    }
   }
 }

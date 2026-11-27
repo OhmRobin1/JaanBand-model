@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import {
   Check,
@@ -99,6 +99,11 @@ export function JaanSaathiWorkerPortal({
 
   const [buddyMood, setBuddyMood] = useState<BuddyMood>('warm');
   const [buddyMessage, setBuddyMessage] = useState<string>('');
+  const [localTurns, setLocalTurns] = useState<
+    Array<{ role: 'worker' | 'buddy'; text: string }>
+  >([]);
+  const lastHydratedCheckinIdRef = useRef<string | null>(null);
+  const recognitionRef = useRef<SpeechRec | null>(null);
   const [speechEnabled, setSpeechEnabled] = useState<boolean>(false);
   const [isListening, setIsListening] = useState<boolean>(false);
   const [copiedUid, setCopiedUid] = useState<boolean>(false);
@@ -128,6 +133,7 @@ export function JaanSaathiWorkerPortal({
       setVault(null);
       setCheckins([]);
       setAssignedWorkers([]);
+      lastHydratedCheckinIdRef.current = null;
       return;
     }
 
@@ -147,7 +153,8 @@ export function JaanSaathiWorkerPortal({
       },
       (list) => {
         setCheckins(list);
-        if (list.length > 0) {
+        if (list.length > 0 && lastHydratedCheckinIdRef.current !== list[0].id) {
+          lastHydratedCheckinIdRef.current = list[0].id;
           setBuddyMessage(list[0].buddyReply);
           setBuddyMood(list[0].buddyMood);
           setCareTip(list[0].gentleCareTip || null);
@@ -171,12 +178,12 @@ export function JaanSaathiWorkerPortal({
   }, [authReady, user]);
 
   useEffect(() => {
-    if (checkins.length === 0) {
+    if (checkins.length === 0 && localTurns.length === 0) {
       setBuddyMessage(currentLanguage.greeting);
       setBuddyMood('warm');
       setCareTip(null);
     }
-  }, [currentLanguage, checkins.length]);
+  }, [currentLanguage, checkins.length, localTurns.length]);
 
   const speakText = useCallback(
     (text: string, locale: string) => {
@@ -235,13 +242,16 @@ export function JaanSaathiWorkerPortal({
     setBuddyMood('listening');
 
     try {
-      const historyPayload = checkins
-        .slice(0, 4)
-        .reverse()
-        .flatMap((c) => [
-          { role: 'worker', text: c.workerMessage },
-          { role: 'buddy', text: c.buddyReply },
-        ]);
+      const historyPayload =
+        checkins.length > 0
+          ? checkins
+              .slice(0, 4)
+              .reverse()
+              .flatMap((c) => [
+                { role: 'worker', text: c.workerMessage },
+                { role: 'buddy', text: c.buddyReply },
+              ])
+          : localTurns.slice(-6);
 
       const firstName =
         activeWorker?.name?.split(' ')[0] ||
@@ -262,12 +272,18 @@ export function JaanSaathiWorkerPortal({
         }),
       });
 
-      const data = (await resp.json()) as Record<string, unknown>;
+      const rawText = await resp.text();
+      let data: Record<string, unknown> = {};
+      try {
+        data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+      } catch {
+        data = {};
+      }
       if (!resp.ok) {
         throw new Error(
           typeof data.error === 'string'
             ? data.error
-            : 'Unable to reach JaanSaathi companion right now.',
+            : `Unable to reach JaanSaathi AI service (HTTP ${resp.status}).`,
         );
       }
 
@@ -283,26 +299,39 @@ export function JaanSaathiWorkerPortal({
       setBuddyMood(nextMood);
       setCareTip(tip || null);
       setMessageInput('');
+      setLocalTurns((prev) => [
+        ...prev.slice(-6),
+        { role: 'worker', text: rawMsg },
+        { role: 'buddy', text: reply },
+      ]);
 
       if (speechEnabled) {
         speakText(reply, currentLanguage.speechLocale);
       }
 
       if (user) {
-        await recordPrivateCheckinAndSyncAnonymizedRf(user, {
-          worker: activeWorker,
-          preferredState: selectedState,
-          languageCode: currentLanguage.code,
-          languageName: `${currentLanguage.nativeName} (${currentLanguage.name})`,
-          workerMessage: rawMsg,
-          buddyReply: reply,
-          buddyMood: nextMood,
-          mentalStrainLevel: strain,
-          mentalRfBoost: boost,
-          gentleCareTip: tip,
-          recommendShadedDuty: recommendShaded,
-          recommendMedicalHold: recommendHold,
-        });
+        try {
+          await recordPrivateCheckinAndSyncAnonymizedRf(user, {
+            worker: activeWorker,
+            preferredState: selectedState,
+            languageCode: currentLanguage.code,
+            languageName: `${currentLanguage.nativeName} (${currentLanguage.name})`,
+            workerMessage: rawMsg,
+            buddyReply: reply,
+            buddyMood: nextMood,
+            mentalStrainLevel: strain,
+            mentalRfBoost: boost,
+            gentleCareTip: tip,
+            recommendShadedDuty: recommendShaded,
+            recommendMedicalHold: recommendHold,
+          });
+        } catch (vaultErr) {
+          setVaultError(
+            vaultErr instanceof Error
+              ? vaultErr.message
+              : 'Private journal save is temporarily delayed.',
+          );
+        }
       }
     } catch (err) {
       setBuddyMood('caring');
@@ -315,6 +344,16 @@ export function JaanSaathiWorkerPortal({
   };
 
   const handleVoiceCapture = () => {
+    if (isListening && recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // Ignore stop errors
+      }
+      setIsListening(false);
+      return;
+    }
+
     const win = window as unknown as {
       SpeechRecognition?: new () => SpeechRec;
       webkitSpeechRecognition?: new () => SpeechRec;
@@ -325,9 +364,9 @@ export function JaanSaathiWorkerPortal({
       return;
     }
 
-    if (isListening) return;
     setChatError(null);
     const rec = new RecCtor();
+    recognitionRef.current = rec;
     rec.lang = currentLanguage.speechLocale;
     rec.interimResults = false;
     rec.maxAlternatives = 1;
@@ -340,8 +379,14 @@ export function JaanSaathiWorkerPortal({
         setMessageInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
       }
     };
-    rec.onerror = () => setIsListening(false);
-    rec.onend = () => setIsListening(false);
+    rec.onerror = () => {
+      recognitionRef.current = null;
+      setIsListening(false);
+    };
+    rec.onend = () => {
+      recognitionRef.current = null;
+      setIsListening(false);
+    };
     rec.start();
   };
 

@@ -169,9 +169,25 @@ export default function App() {
     try {
       await signInWithGoogle();
     } catch (err) {
-      setAuthError(
-        err instanceof Error ? err.message : 'Google Sign-In cancelled or blocked',
-      );
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (code === 'auth/unauthorized-domain') {
+        setAuthError(
+          `Domain "${window.location.hostname}" is not authorized for Google Sign-In. Add it in Firebase Console -> Authentication -> Settings -> Authorized domains.`,
+        );
+      } else if (code === 'auth/popup-blocked') {
+        setAuthError(
+          'Google Sign-In popup was blocked by your browser. Please allow popups for this site or open the app in a new tab.',
+        );
+      } else if (code === 'auth/popup-closed-by-user') {
+        setAuthError('Google Sign-In popup was closed before completing sign-in.');
+      } else {
+        setAuthError(
+          err instanceof Error ? err.message : 'Google Sign-In cancelled or blocked',
+        );
+      }
     }
   }, []);
 
