@@ -42,6 +42,15 @@ service cloud.firestore {
       return isSignedIn() && isEmailVerified() && request.auth.uid == ownerUid;
     }
 
+    function isWorkerSelf(data) {
+      return isSignedIn()
+        && isEmailVerified()
+        && 'workerUid' in data
+        && data.workerUid is string
+        && data.workerUid != ''
+        && request.auth.uid == data.workerUid;
+    }
+
     // 3. Validation Blueprints
     function isValidReasons(reasons) {
       return reasons is list
@@ -120,6 +129,7 @@ service cloud.firestore {
         'mq3Status', 'mq3MgL', 'mq3CheckedAt',
         'shiftHours', 'shiftStartHr', 'lastKeepAliveAt', 'leadOff',
         'riskFactor', 'dynamicHrY', 'dynamicHrR',
+        'mentalStrainLevel', 'mentalRfBoost', 'mentalAdjustedAt', 'workerUid',
         'condition', 'reasons', 'lastReport', 'ownerUid', 'createdAt', 'updatedAt'
       ])
       && isValidId(data.id)
@@ -148,12 +158,59 @@ service cloud.firestore {
       && (!('riskFactor' in data) || (data.riskFactor is number && data.riskFactor >= 0.8 && data.riskFactor <= 2.5))
       && (!('dynamicHrY' in data) || (data.dynamicHrY is number && data.dynamicHrY >= 70 && data.dynamicHrY <= 160))
       && (!('dynamicHrR' in data) || (data.dynamicHrR is number && data.dynamicHrR >= 85 && data.dynamicHrR <= 180))
+      && (!('mentalStrainLevel' in data) || (data.mentalStrainLevel is string && data.mentalStrainLevel in ['calm', 'mild', 'strained', 'rest_advised']))
+      && (!('mentalRfBoost' in data) || (data.mentalRfBoost is number && data.mentalRfBoost >= 0 && data.mentalRfBoost <= 0.25))
+      && (!('mentalAdjustedAt' in data) || isValidOptionalIsoTimestamp(data.mentalAdjustedAt))
+      && (!('workerUid' in data) || data.workerUid == null || (data.workerUid is string && data.workerUid.size() <= 128))
       && data.condition in ['unlinked', 'normal', 'caution', 'critical']
       && isValidReasons(data.reasons)
       && (data.lastReport == null || isValidReportSnapshot(data.lastReport))
       && data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128
       && data.createdAt is timestamp
       && data.updatedAt is timestamp;
+    }
+
+    function isValidPrivateVault(data, uid) {
+      return data.keys().hasAll(['workerUid', 'preferredLanguageCode', 'updatedAt'])
+        && data.keys().hasOnly([
+          'workerUid', 'workerId', 'preferredLanguageCode', 'preferredState',
+          'lastMentalStrainLevel', 'lastMentalRfBoost', 'updatedAt'
+        ])
+        && data.workerUid == uid
+        && (!('workerId' in data) || (data.workerId is string && data.workerId.size() <= 128))
+        && data.preferredLanguageCode is string && data.preferredLanguageCode.size() >= 2 && data.preferredLanguageCode.size() <= 16
+        && (!('preferredState' in data) || (data.preferredState is string && data.preferredState.size() >= 1 && data.preferredState.size() <= 64))
+        && (!('lastMentalStrainLevel' in data) || (data.lastMentalStrainLevel is string && data.lastMentalStrainLevel in ['calm', 'mild', 'strained', 'rest_advised']))
+        && (!('lastMentalRfBoost' in data) || (data.lastMentalRfBoost is number && data.lastMentalRfBoost >= 0 && data.lastMentalRfBoost <= 0.25))
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPrivateCheckin(data, uid, checkinId) {
+      return data.keys().hasAll([
+          'id', 'workerUid', 'languageCode', 'languageName',
+          'workerMessage', 'buddyReply', 'buddyMood',
+          'mentalStrainLevel', 'mentalRfBoost', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'workerUid', 'workerId', 'languageCode', 'languageName',
+          'workerMessage', 'buddyReply', 'buddyMood',
+          'mentalStrainLevel', 'mentalRfBoost', 'gentleCareTip',
+          'syncedToBand', 'createdAt'
+        ])
+        && isValidId(checkinId)
+        && data.id == checkinId
+        && data.workerUid == uid
+        && (!('workerId' in data) || (data.workerId is string && data.workerId.size() <= 128))
+        && data.languageCode is string && data.languageCode.size() >= 2 && data.languageCode.size() <= 16
+        && data.languageName is string && data.languageName.size() >= 1 && data.languageName.size() <= 64
+        && data.workerMessage is string && data.workerMessage.size() >= 1 && data.workerMessage.size() <= 2000
+        && data.buddyReply is string && data.buddyReply.size() >= 1 && data.buddyReply.size() <= 2500
+        && data.buddyMood in ['warm', 'listening', 'encouraging', 'caring', 'alert']
+        && data.mentalStrainLevel in ['calm', 'mild', 'strained', 'rest_advised']
+        && data.mentalRfBoost is number && data.mentalRfBoost >= 0 && data.mentalRfBoost <= 0.25
+        && (!('gentleCareTip' in data) || (data.gentleCareTip is string && data.gentleCareTip.size() <= 400))
+        && (!('syncedToBand' in data) || data.syncedToBand is bool)
+        && data.createdAt is timestamp;
     }
 
     function isValidTelemetryReport(data, parentWorkerId) {
@@ -212,11 +269,15 @@ service cloud.firestore {
       allow get: if isSignedIn()
         && isEmailVerified()
         && isValidId(workerId)
-        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)));
+        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)) || isWorkerSelf(existing()));
 
       allow list: if isSignedIn()
         && isEmailVerified()
-        && (isAdmin() || resource.data.ownerUid == request.auth.uid);
+        && (
+          isAdmin()
+          || resource.data.ownerUid == request.auth.uid
+          || resource.data.workerUid == request.auth.uid
+        );
 
       allow create: if isSignedIn()
         && isEmailVerified()
@@ -238,34 +299,50 @@ service cloud.firestore {
           || ((!('createdAt' in existing()) || !(existing().createdAt is timestamp)) && incoming().createdAt == request.time)
         )
         && incoming().updatedAt == request.time
-        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)))
         && (
-          // Action: Update worker metadata, health baseline profile, Fit-to-Work clearance, mount mode, MQ-3 gate, or band pairing
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
-            'age', 'conditions', 'restingBp', 'mountMode',
-            'daysOnSite', 'dutyZone', 'readiness', 'gaitBalance', 'fitStatus', 'fitReasons',
-            'mq3Status', 'mq3MgL', 'mq3CheckedAt',
-            'shiftHours', 'shiftStartHr',
-            'riskFactor', 'dynamicHrY', 'dynamicHrR',
-            'condition', 'reasons', 'updatedAt'
-          ])
+          (
+            (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)))
+            && (
+              // Action: Update worker metadata, health baseline profile, Fit-to-Work clearance, mount mode, MQ-3 gate, workerUid pairing, or band pairing
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
+                'age', 'conditions', 'restingBp', 'mountMode',
+                'daysOnSite', 'dutyZone', 'readiness', 'gaitBalance', 'fitStatus', 'fitReasons',
+                'mq3Status', 'mq3MgL', 'mq3CheckedAt',
+                'shiftHours', 'shiftStartHr',
+                'riskFactor', 'dynamicHrY', 'dynamicHrR',
+                'mentalStrainLevel', 'mentalRfBoost', 'mentalAdjustedAt', 'workerUid',
+                'condition', 'reasons', 'updatedAt'
+              ])
+              ||
+              // Action: Record latest live band telemetry state
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'bandId', 'condition', 'reasons', 'lastReport',
+                'lastKeepAliveAt', 'leadOff', 'shiftHours', 'shiftStartHr',
+                'fitStatus', 'fitReasons',
+                'riskFactor', 'dynamicHrY', 'dynamicHrR', 'updatedAt'
+              ])
+              ||
+              // Action: Update 15s keep-alive heartbeat or mechanical lead-off disconnect state
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'lastKeepAliveAt', 'leadOff', 'fitStatus', 'fitReasons',
+                'condition', 'reasons', 'updatedAt'
+              ])
+              ||
+              isAdmin()
+            )
+          )
           ||
-          // Action: Record latest live band telemetry state
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'bandId', 'condition', 'reasons', 'lastReport',
-            'lastKeepAliveAt', 'leadOff', 'shiftHours', 'shiftStartHr',
-            'fitStatus', 'fitReasons',
-            'riskFactor', 'dynamicHrY', 'dynamicHrR', 'updatedAt'
-          ])
-          ||
-          // Action: Update 15s keep-alive heartbeat or mechanical lead-off disconnect state
-          incoming().diff(existing()).affectedKeys().hasOnly([
-            'lastKeepAliveAt', 'leadOff', 'fitStatus', 'fitReasons',
-            'condition', 'reasons', 'updatedAt'
-          ])
-          ||
-          isAdmin()
+          (
+            // Action: Paired worker (JaanSaathi) syncs ONLY anonymized mental fitness adjustment (never private text)
+            isWorkerSelf(existing())
+            && incoming().workerUid == existing().workerUid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'mentalStrainLevel', 'mentalRfBoost', 'mentalAdjustedAt',
+              'fitStatus', 'fitReasons',
+              'riskFactor', 'dynamicHrY', 'dynamicHrR', 'updatedAt'
+            ])
+          )
         );
 
       allow delete: if isSignedIn()
@@ -307,6 +384,47 @@ service cloud.firestore {
           && isValidId(workerId)
           && isValidId(reportId)
           && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)));
+      }
+    }
+
+    // Strict Zero-Leak Private Worker Vault — NEVER readable by managers or admins
+    match /worker_private/{workerUid} {
+      allow get: if isSignedIn()
+        && isEmailVerified()
+        && request.auth.uid == workerUid;
+
+      allow list: if false;
+
+      allow create, update: if isSignedIn()
+        && isEmailVerified()
+        && request.auth.uid == workerUid
+        && isValidPrivateVault(incoming(), workerUid)
+        && incoming().updatedAt == request.time;
+
+      allow delete: if isSignedIn()
+        && isEmailVerified()
+        && request.auth.uid == workerUid;
+
+      match /checkins/{checkinId} {
+        allow get, list: if isSignedIn()
+          && isEmailVerified()
+          && request.auth.uid == workerUid;
+
+        allow create: if isSignedIn()
+          && isEmailVerified()
+          && request.auth.uid == workerUid
+          && isValidPrivateCheckin(incoming(), workerUid, checkinId)
+          && incoming().createdAt == request.time;
+
+        allow update: if isSignedIn()
+          && isEmailVerified()
+          && request.auth.uid == workerUid
+          && isValidPrivateCheckin(incoming(), workerUid, checkinId)
+          && incoming().createdAt == existing().createdAt;
+
+        allow delete: if isSignedIn()
+          && isEmailVerified()
+          && request.auth.uid == workerUid;
       }
     }
   }

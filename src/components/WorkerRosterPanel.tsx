@@ -204,6 +204,7 @@ export function WorkerRosterPanel({
   const [pGait, setPGait] = useState<GaitBalanceStatus>('pending');
   const [pShiftHrs, setPShiftHrs] = useState('0');
   const [pStartHr, setPStartHr] = useState('');
+  const [pWorkerUid, setPWorkerUid] = useState('');
   const [pConds, setPConds] = useState<WorkerConditions>({
     hypertension: false,
     diabetes: false,
@@ -279,6 +280,7 @@ export function WorkerRosterPanel({
     setPGait(w.gaitBalance);
     setPShiftHrs(String(w.shiftHours));
     setPStartHr(w.shiftStartHr !== null ? String(w.shiftStartHr) : '');
+    setPWorkerUid(w.workerUid || '');
     setPConds({ ...w.conditions });
     setPReadiness({ ...w.readiness });
   };
@@ -298,6 +300,7 @@ export function WorkerRosterPanel({
         readiness: pReadiness,
         shiftHours: Number(pShiftHrs),
         shiftStartHr: pStartHr.trim() ? Number(pStartHr) : null,
+        workerUid: pWorkerUid.trim() ? pWorkerUid.trim() : null,
         conditions: pConds,
       });
       onMountSaved?.(w.id, pMount);
@@ -1117,6 +1120,26 @@ export function WorkerRosterPanel({
                               <option value="sway">Postural Sway (Flag)</option>
                             </select>
                           </label>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            maxLength={128}
+                            value={pWorkerUid}
+                            onChange={(e) => setPWorkerUid(e.target.value)}
+                            placeholder="Optional JaanSaathi Worker UID (for private wellbeing Rf sync)"
+                            className="flex-1 px-2 py-1 rounded bg-obsidian-900 border border-white/10 text-[11px] font-mono text-white placeholder:text-slate-500"
+                          />
+                          {user && (
+                            <button
+                              type="button"
+                              onClick={() => setPWorkerUid(user.uid)}
+                              className="px-2 py-1 rounded bg-obsidian-900 border border-white/10 text-[10px] font-mono text-emeraldGlow hover:border-emeraldGlow/40 cursor-pointer shrink-0"
+                            >
+                              Use My UID
+                            </button>
+                          )}
                         </div>
 
                         <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">

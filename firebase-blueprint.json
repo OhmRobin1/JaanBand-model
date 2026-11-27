@@ -142,6 +142,27 @@
           "type": "number",
           "description": "Individualized critical heart-rate threshold in BPM (85-180)"
         },
+        "mentalStrainLevel": {
+          "type": "string",
+          "description": "Anonymized wellbeing strain tier synced by JaanSaathi (no private details)",
+          "enum": ["calm", "mild", "strained", "rest_advised"]
+        },
+        "mentalRfBoost": {
+          "type": "number",
+          "description": "Anonymized risk multiplier adjustment (0.0-0.25) from JaanSaathi"
+        },
+        "mentalAdjustedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 timestamp of latest anonymized wellbeing sync or null",
+          "minLength": 10,
+          "maxLength": 40
+        },
+        "workerUid": {
+          "type": "string",
+          "description": "Optional paired worker Firebase Auth UID allowing self-only anonymized wellbeing sync or null",
+          "maxLength": 128
+        },
         "condition": {
           "type": "string",
           "description": "Latest evaluated physiological condition",
@@ -331,6 +352,121 @@
         }
       },
       "required": ["uid"]
+    },
+    "WorkerPrivateVault": {
+      "title": "WorkerPrivateVault",
+      "description": "Strict worker-only wellbeing preferences and latest self-check-in state (inaccessible to managers/admins).",
+      "type": "object",
+      "properties": {
+        "workerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "preferredLanguageCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 16
+        },
+        "preferredState": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "lastMentalStrainLevel": {
+          "type": "string",
+          "enum": ["calm", "mild", "strained", "rest_advised"]
+        },
+        "lastMentalRfBoost": {
+          "type": "number"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["workerUid", "preferredLanguageCode", "updatedAt"]
+    },
+    "WorkerPrivateCheckin": {
+      "title": "WorkerPrivateCheckin",
+      "description": "Private worker conversation entry with JaanSaathi Buddy (readable & writable strictly by request.auth.uid == workerUid).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "workerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workerId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "languageCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 16
+        },
+        "languageName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "workerMessage": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "buddyReply": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2500
+        },
+        "buddyMood": {
+          "type": "string",
+          "enum": ["warm", "listening", "encouraging", "caring", "alert"]
+        },
+        "mentalStrainLevel": {
+          "type": "string",
+          "enum": ["calm", "mild", "strained", "rest_advised"]
+        },
+        "mentalRfBoost": {
+          "type": "number"
+        },
+        "gentleCareTip": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "syncedToBand": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "workerUid",
+        "languageCode",
+        "languageName",
+        "workerMessage",
+        "buddyReply",
+        "buddyMood",
+        "mentalStrainLevel",
+        "mentalRfBoost",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -338,7 +474,7 @@
       "schema": {
         "$ref": "#/entities/Worker"
       },
-      "description": "Primary worker roster, health history profile, mount configuration, MQ-3 gate screening, keep-alive failsafe, and active biometric snapshot."
+      "description": "Primary worker roster, health history profile, mount configuration, MQ-3 gate screening, keep-alive failsafe, anonymized mental Rf boost, and active biometric snapshot."
     },
     "/workers/{workerId}/telemetry/{reportId}": {
       "schema": {
@@ -351,6 +487,18 @@
         "$ref": "#/entities/AdminRecord"
       },
       "description": "Explicit site administrator UIDs authorized across all worker cohorts."
+    },
+    "/worker_private/{workerUid}": {
+      "schema": {
+        "$ref": "#/entities/WorkerPrivateVault"
+      },
+      "description": "Worker-only private preferences and state; strictly denied to site managers and admins."
+    },
+    "/worker_private/{workerUid}/checkins/{checkinId}": {
+      "schema": {
+        "$ref": "#/entities/WorkerPrivateCheckin"
+      },
+      "description": "Worker-only private health, stress, and personal check-in journal with JaanSaathi Buddy; strictly denied to site managers and admins."
     }
   }
 }

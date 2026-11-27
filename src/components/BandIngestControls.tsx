@@ -320,22 +320,22 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
-// JaanShield Fit-to-Work Fallback Evaluator (matches JaanBand MK-IV rules)
+// JaanShield Fit-to-Work Fallback Evaluator (matches JaanBand MK-IV & anonymized JaanSaathi Rf)
 export function resolveFitToWork(w) {
   if (w.fitStatus) return { status: w.fitStatus, reasons: w.fitReasons || [] };
   const [sys = 120, dia = 80] = String(w.restingBp || "120/80").split("/").map(Number);
   const r = w.readiness || {};
   const rep = w.lastReport || null;
-  if (w.leadOff || sys >= 160 || dia >= 100 || r.dizzyOrUnwell || (rep && rep.skinTempC >= 37.3) || w.condition === "critical") {
+  if (w.leadOff || sys >= 160 || dia >= 100 || r.dizzyOrUnwell || w.mentalStrainLevel === "rest_advised" || (rep && rep.skinTempC >= 37.3) || w.condition === "critical") {
     return { status: "medical_hold", reasons: w.reasons || ["Medical Hold"] };
   }
-  if (w.mq3Status === "flagged" || w.gaitBalance === "sway" || (w.daysOnSite ?? 14) < 7 || r.lowSleep || r.sedatingMeds || (rep?.perfusionIndex ?? 2) < 0.8 || (rep?.batteryPct ?? 100) < 15 || w.condition === "caution") {
+  if (w.mq3Status === "flagged" || w.gaitBalance === "sway" || (w.daysOnSite ?? 14) < 7 || r.lowSleep || r.sedatingMeds || w.mentalStrainLevel === "strained" || (w.mentalRfBoost ?? 0) >= 0.12 || (rep?.perfusionIndex ?? 2) < 0.8 || (rep?.batteryPct ?? 100) < 15 || w.condition === "caution") {
     return { status: "shaded_only", reasons: w.reasons || ["Shaded Ground Duty Only"] };
   }
   return { status: "fit_full", reasons: ["Cleared for Full Duty"] };
 }
 
-// Stream workers with dynamic Rf, Fit-to-Work (BP, acclimatization, gait, readiness, PI, battery) & 15s keep-alive
+// Stream workers with dynamic Rf, Fit-to-Work (BP, acclimatization, gait, readiness, anonymized wellbeing Rf) & 15s keep-alive
 const q = query(collection(db, "workers"), where("ownerUid", "==", auth.currentUser.uid));
 onSnapshot(q, (snap) => {
   const workers = snap.docs.map((d) => {

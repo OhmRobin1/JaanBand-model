@@ -8,6 +8,7 @@ import {
   Check,
   Droplets,
   ExternalLink,
+  HeartHandshake,
   HeartPulse,
   Infinity as InfinityIcon,
   Layers,
@@ -23,6 +24,7 @@ import {
 import { BandIngestControls } from './components/BandIngestControls';
 import { BandViewport3D } from './components/BandViewport3D';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
+import { JaanSaathiWorkerPortal } from './components/JaanSaathiWorkerPortal';
 import { LiveTelemetryWave } from './components/LiveTelemetryWave';
 import { WorkerRosterPanel } from './components/WorkerRosterPanel';
 import {
@@ -81,6 +83,15 @@ const INITIAL_CHECKS: DiagnosticCheckItem[] = [
 ];
 
 export default function App() {
+  const [viewMode, setViewMode] = useState<'band' | 'worker'>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('view') === 'worker' || window.location.pathname === '/worker') {
+        return 'worker';
+      }
+    }
+    return 'band';
+  });
   const [selectedFinishId, setSelectedFinishId] = useState<FinishId>('obsidian');
   const [previewMountMode, setPreviewMountMode] = useState<MountMode>('wrist');
   const [exploded, setExploded] = useState(false);
@@ -327,6 +338,8 @@ export default function App() {
         selectedWorker.leadOff || selectedKeepAlive.state === 'disconnected',
       condition: activeCondition,
       lastReport: selectedWorker.lastReport,
+      mentalStrainLevel: selectedWorker.mentalStrainLevel,
+      mentalRfBoost: selectedWorker.mentalRfBoost,
     });
   }, [selectedWorker, selectedKeepAlive.state, activeCondition]);
 
@@ -352,6 +365,9 @@ export default function App() {
     if (selectedWorker.readiness.dizzyOrUnwell) tags.push('Dizzy / Unwell');
     if (selectedWorker.shiftHours >= 4) {
       tags.push(`Shift ${selectedWorker.shiftHours.toFixed(1)}h (Fatigue)`);
+    }
+    if (selectedWorker.mentalRfBoost > 0 || selectedWorker.mentalStrainLevel !== 'calm') {
+      tags.push(`Wellbeing +${selectedWorker.mentalRfBoost.toFixed(2)} Rf (Private)`);
     }
     return tags;
   }, [selectedWorker]);
@@ -381,6 +397,32 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            <div className="inline-flex items-center p-0.5 rounded-full bg-obsidian-900 border border-white/10">
+              <button
+                type="button"
+                onClick={() => setViewMode('band')}
+                className={`px-2.5 py-1 rounded-full text-[11px] font-mono transition-colors cursor-pointer ${
+                  viewMode === 'band'
+                    ? 'bg-emeraldGlow/15 text-emeraldGlow font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Band Studio
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('worker')}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-mono transition-colors cursor-pointer ${
+                  viewMode === 'worker'
+                    ? 'bg-titaniumGold/20 text-titaniumGold font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <HeartHandshake className="w-3 h-3" aria-hidden="true" />
+                <span>JaanSaathi App</span>
+              </button>
+            </div>
+
             <div
               className={`${
                 isStreamConnected ? 'inline-flex' : 'hidden sm:inline-flex'
@@ -501,7 +543,15 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Executive Stage */}
+      {viewMode === 'worker' ? (
+        <JaanSaathiWorkerPortal
+          user={user}
+          authReady={authReady}
+          onSignIn={handleSignIn}
+          managerWorkers={workers}
+        />
+      ) : (
+      /* Main Executive Stage */
       <main className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 lg:pt-6">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-6 items-start">
           {/* Left Column: 3D Modular Puck Viewport + Spec Metrics + Worker Registry */}
@@ -1087,6 +1137,7 @@ export default function App() {
           </div>
         </div>
       </main>
+      )}
     </div>
   );
 }

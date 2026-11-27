@@ -2,7 +2,9 @@ import {
   collection,
   doc,
   getDocs,
+  limit,
   onSnapshot,
+  orderBy,
   query,
   serverTimestamp,
   setDoc,
@@ -20,6 +22,7 @@ import {
   isAdminUser,
 } from '../firebase';
 import {
+  BuddyMood,
   ConditionLevel,
   DEFAULT_THRESHOLDS,
   DutyZone,
@@ -28,12 +31,15 @@ import {
   FitToWorkStatus,
   GaitBalanceStatus,
   KeepAliveStatus,
+  MentalStrainLevel,
   MountMode,
   Mq3Status,
   TelemetryReport,
   TelemetrySource,
   ThresholdConfig,
   WorkerConditions,
+  WorkerPrivateCheckin,
+  WorkerPrivateVault,
   WorkerReadiness,
   WorkerRecord,
 } from '../types/band';
@@ -118,6 +124,13 @@ export function normalizeReadiness(raw: unknown): WorkerReadiness {
   };
 }
 
+export function normalizeMentalStrain(raw: unknown): MentalStrainLevel {
+  if (raw === 'mild' || raw === 'strained' || raw === 'rest_advised') {
+    return raw;
+  }
+  return 'calm';
+}
+
 export function computeDynamicRiskProfile(profile: {
   age?: number;
   conditions?: WorkerConditions;
@@ -128,6 +141,8 @@ export function computeDynamicRiskProfile(profile: {
   mq3Status?: Mq3Status;
   baselineHr?: number;
   loadFactor?: number;
+  mentalRfBoost?: number;
+  mentalStrainLevel?: MentalStrainLevel;
 }): DynamicRiskProfile {
   const age = clampFinite(profile.age, 18, 85) ?? 30;
   const conditions = profile.conditions ?? {
@@ -145,6 +160,8 @@ export function computeDynamicRiskProfile(profile: {
   const shiftHours = clampFinite(profile.shiftHours, 0, 24) ?? 0;
   const loadFactor = clampFinite(profile.loadFactor, 0.1, 2.0) ?? 0.5;
   const mq3Status: Mq3Status = profile.mq3Status ?? 'pending';
+  const mentalRfBoost = Number((clampFinite(profile.mentalRfBoost, 0, 0.25) ?? 0).toFixed(2));
+  const mentalStrainLevel = normalizeMentalStrain(profile.mentalStrainLevel);
 
   let rf = 1.0;
   const riskTags: string[] = [];
@@ -201,6 +218,19 @@ export function computeDynamicRiskProfile(profile: {
   if (mq3Status === 'flagged') {
     rf += 0.1;
     riskTags.push('Breath Alcohol Flag');
+  }
+
+  if (mentalRfBoost > 0 || mentalStrainLevel !== 'calm') {
+    const appliedBoost =
+      mentalRfBoost > 0
+        ? mentalRfBoost
+        : mentalStrainLevel === 'rest_advised'
+          ? 0.22
+          : mentalStrainLevel === 'strained'
+            ? 0.14
+            : 0.06;
+    rf += appliedBoost;
+    riskTags.push(`Wellbeing Load +${appliedBoost.toFixed(2)}`);
   }
 
   const riskFactor = Number(Math.min(2.5, rf).toFixed(2));
@@ -333,6 +363,8 @@ export function evaluateCondition(
     shiftHours?: number;
     baselineHr?: number;
     loadFactor?: number;
+    mentalRfBoost?: number;
+    mentalStrainLevel?: MentalStrainLevel;
   },
 ): {
   condition: Exclude<ConditionLevel, 'unlinked'>;
@@ -351,6 +383,8 @@ export function evaluateCondition(
   };
   const gaitBalance: GaitBalanceStatus = workerContext?.gaitBalance ?? 'pending';
   const { systolic, diastolic } = parseRestingBp(workerContext?.restingBp);
+  const mentalStrainLevel = normalizeMentalStrain(workerContext?.mentalStrainLevel);
+  const mentalRfBoost = clampFinite(workerContext?.mentalRfBoost, 0, 0.25) ?? 0;
 
   const profile = computeDynamicRiskProfile({
     age: workerContext?.age,
@@ -362,6 +396,8 @@ export function evaluateCondition(
     mq3Status: workerContext?.mq3Status,
     baselineHr,
     loadFactor: workerContext?.loadFactor,
+    mentalRfBoost,
+    mentalStrainLevel,
   });
   const thresholds = profile.thresholds;
   const criticalReasons: string[] = [];
@@ -539,6 +575,16 @@ export function evaluateCondition(
     }
   }
 
+  if (mentalStrainLevel === 'rest_advised') {
+    criticalReasons.push(
+      'Wellbeing & Recovery Hold advised (private worker details withheld)',
+    );
+  } else if (mentalStrainLevel === 'strained' || mentalRfBoost >= 0.12) {
+    cautionReasons.push(
+      'Wellbeing pacing adjustment active (private worker details withheld)',
+    );
+  }
+
   if (criticalReasons.length > 0) {
     return {
       condition: 'critical',
@@ -580,6 +626,8 @@ export function evaluateFitToWork(input: {
   leadOff?: boolean;
   condition?: ConditionLevel;
   lastReport?: TelemetryReport | null;
+  mentalStrainLevel?: MentalStrainLevel;
+  mentalRfBoost?: number;
 }): FitToWorkEvaluation {
   const { systolic, diastolic } = parseRestingBp(input.restingBp);
   const baselineHr = input.baselineHr ?? 74;
@@ -593,9 +641,21 @@ export function evaluateFitToWork(input: {
   };
   const gaitBalance: GaitBalanceStatus = input.gaitBalance ?? 'pending';
   const report = input.lastReport ?? null;
+  const mentalStrainLevel = normalizeMentalStrain(input.mentalStrainLevel);
+  const mentalRfBoost = clampFinite(input.mentalRfBoost, 0, 0.25) ?? 0;
 
   const holdReasons: string[] = [];
   const shadedReasons: string[] = [];
+
+  if (mentalStrainLevel === 'rest_advised') {
+    holdReasons.push(
+      'Wellbeing & Recovery Hold advised (private details withheld)',
+    );
+  } else if (mentalStrainLevel === 'strained' || mentalRfBoost >= 0.12) {
+    shadedReasons.push(
+      'Wellbeing pacing adjustment — shaded / light duty only (private details withheld)',
+    );
+  }
 
   if (input.leadOff) {
     holdReasons.push(
@@ -824,6 +884,13 @@ function mapDocToWorker(
   const shiftStartHr = clampFinite(data.shiftStartHr, 30, 200);
   const leadOff = Boolean(data.leadOff);
   const condition = (data.condition as ConditionLevel) || 'unlinked';
+  const mentalStrainLevel = normalizeMentalStrain(data.mentalStrainLevel);
+  const mentalRfBoost = clampFinite(data.mentalRfBoost, 0, 0.25) ?? 0;
+  const mentalAdjustedAt = sanitizeIsoTimestamp(data.mentalAdjustedAt);
+  const workerUid =
+    typeof data.workerUid === 'string' && data.workerUid.trim()
+      ? data.workerUid.trim().slice(0, 128)
+      : null;
 
   const computedProfile = computeDynamicRiskProfile({
     age,
@@ -835,6 +902,8 @@ function mapDocToWorker(
     mq3Status,
     baselineHr,
     loadFactor,
+    mentalRfBoost,
+    mentalStrainLevel,
   });
 
   const computedFit = evaluateFitToWork({
@@ -852,6 +921,8 @@ function mapDocToWorker(
     leadOff,
     condition,
     lastReport,
+    mentalStrainLevel,
+    mentalRfBoost,
   });
 
   const fitStatus: FitToWorkStatus =
@@ -900,6 +971,10 @@ function mapDocToWorker(
       clampFinite(data.dynamicHrY, 70, 160) ?? computedProfile.thresholds.hrY,
     dynamicHrR:
       clampFinite(data.dynamicHrR, 85, 180) ?? computedProfile.thresholds.hrR,
+    mentalStrainLevel,
+    mentalRfBoost,
+    mentalAdjustedAt,
+    workerUid,
     condition,
     reasons: Array.isArray(data.reasons)
       ? data.reasons.map((r) => String(r)).slice(0, 10)
@@ -942,6 +1017,10 @@ function buildCanonicalWorkerPayload(
     riskFactor: number;
     dynamicHrY: number;
     dynamicHrR: number;
+    mentalStrainLevel: MentalStrainLevel;
+    mentalRfBoost: number;
+    mentalAdjustedAt: string | null;
+    workerUid: string | null;
     condition: ConditionLevel;
     reasons: string[];
     lastReport: TelemetryReport | null;
@@ -1017,6 +1096,31 @@ function buildCanonicalWorkerPayload(
     dynamicHrR: Math.round(
       clampFinite(overrides.dynamicHrR ?? worker.dynamicHrR, 85, 180) ?? 140,
     ),
+    mentalStrainLevel: normalizeMentalStrain(
+      overrides.mentalStrainLevel ?? worker.mentalStrainLevel,
+    ),
+    mentalRfBoost: Number(
+      (
+        clampFinite(
+          overrides.mentalRfBoost !== undefined
+            ? overrides.mentalRfBoost
+            : worker.mentalRfBoost,
+          0,
+          0.25,
+        ) ?? 0
+      ).toFixed(2),
+    ),
+    mentalAdjustedAt: sanitizeIsoTimestamp(
+      overrides.mentalAdjustedAt !== undefined
+        ? overrides.mentalAdjustedAt
+        : worker.mentalAdjustedAt,
+    ),
+    workerUid:
+      overrides.workerUid !== undefined
+        ? overrides.workerUid
+          ? sanitizeText(overrides.workerUid, 128)
+          : null
+        : worker.workerUid ?? null,
     condition: overrides.condition ?? worker.condition,
     reasons: safeReasons.length > 0 ? safeReasons : ['Band paired'],
     lastReport:
@@ -1037,6 +1141,31 @@ export function subscribeWorkers(
     ? workersRef
     : query(workersRef, where('ownerUid', '==', user.uid));
 
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const list = snapshot.docs
+        .map((d) => mapDocToWorker(d.id, d.data() as Record<string, unknown>))
+        .sort((a, b) => a.id.localeCompare(b.id));
+      onWorkers(list);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.LIST, 'workers');
+      } catch (wrapped) {
+        onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+}
+
+export function subscribeAssignedWorkerForSaathi(
+  user: User,
+  onWorkers: (workers: WorkerRecord[]) => void,
+  onError: (err: Error) => void,
+): Unsubscribe {
+  const workersRef = collection(db, 'workers');
+  const q = query(workersRef, where('workerUid', '==', user.uid));
   return onSnapshot(
     q,
     (snapshot) => {
@@ -1114,6 +1243,8 @@ export async function upsertWorker(
     mq3Status,
     baselineHr,
     loadFactor,
+    mentalRfBoost: existing?.mentalRfBoost,
+    mentalStrainLevel: existing?.mentalStrainLevel,
   });
 
   const fit = evaluateFitToWork({
@@ -1131,6 +1262,8 @@ export async function upsertWorker(
     leadOff: existing?.leadOff ?? false,
     condition: existing?.lastReport ? existing.condition : 'unlinked',
     lastReport: existing?.lastReport ?? null,
+    mentalStrainLevel: existing?.mentalStrainLevel,
+    mentalRfBoost: existing?.mentalRfBoost,
   });
 
   const batch = writeBatch(db);
@@ -1211,6 +1344,10 @@ export async function upsertWorker(
       riskFactor: dyn.riskFactor,
       dynamicHrY: dyn.thresholds.hrY,
       dynamicHrR: dyn.thresholds.hrR,
+      mentalStrainLevel: 'calm',
+      mentalRfBoost: 0,
+      mentalAdjustedAt: null,
+      workerUid: null,
       condition: 'unlinked',
       reasons: [bandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired'],
       lastReport: null,
@@ -1244,6 +1381,7 @@ export async function updateWorkerHealthProfile(
     shiftStartHr?: number | null;
     mq3Status?: Mq3Status;
     mq3MgL?: number | null;
+    workerUid?: string | null;
   },
 ): Promise<void> {
   const age = Math.round(clampFinite(patch.age ?? worker.age, 18, 85) ?? 30);
@@ -1270,6 +1408,12 @@ export async function updateWorkerHealthProfile(
     patch.mq3MgL !== undefined
       ? clampFinite(patch.mq3MgL, 0, 2.5)
       : worker.mq3MgL;
+  const workerUid =
+    patch.workerUid !== undefined
+      ? patch.workerUid
+        ? sanitizeText(patch.workerUid, 128)
+        : null
+      : worker.workerUid;
 
   const dyn = computeDynamicRiskProfile({
     age,
@@ -1281,6 +1425,8 @@ export async function updateWorkerHealthProfile(
     mq3Status,
     baselineHr,
     loadFactor: worker.loadFactor,
+    mentalRfBoost: worker.mentalRfBoost,
+    mentalStrainLevel: worker.mentalStrainLevel,
   });
 
   let nextCondition = worker.condition;
@@ -1300,6 +1446,8 @@ export async function updateWorkerHealthProfile(
       shiftHours,
       baselineHr,
       loadFactor: worker.loadFactor,
+      mentalRfBoost: worker.mentalRfBoost,
+      mentalStrainLevel: worker.mentalStrainLevel,
     });
     nextCondition = reEval.condition;
     nextReasons = reEval.reasons;
@@ -1342,6 +1490,8 @@ export async function updateWorkerHealthProfile(
     leadOff: worker.leadOff,
     condition: nextCondition,
     lastReport: worker.lastReport,
+    mentalStrainLevel: worker.mentalStrainLevel,
+    mentalRfBoost: worker.mentalRfBoost,
   });
 
   const payload = buildCanonicalWorkerPayload(worker, {
@@ -1364,6 +1514,7 @@ export async function updateWorkerHealthProfile(
         : worker.mq3CheckedAt,
     shiftHours,
     shiftStartHr,
+    workerUid,
     riskFactor: dyn.riskFactor,
     dynamicHrY: dyn.thresholds.hrY,
     dynamicHrR: dyn.thresholds.hrR,
@@ -1408,6 +1559,8 @@ export async function recordKeepAliveHeartbeat(
         shiftHours: worker.shiftHours,
         baselineHr: worker.baselineHr,
         loadFactor: worker.loadFactor,
+        mentalRfBoost: worker.mentalRfBoost,
+        mentalStrainLevel: worker.mentalStrainLevel,
       },
     );
     nextCondition = reEval.condition;
@@ -1436,6 +1589,8 @@ export async function recordKeepAliveHeartbeat(
     leadOff,
     condition: nextCondition,
     lastReport: worker.lastReport,
+    mentalStrainLevel: worker.mentalStrainLevel,
+    mentalRfBoost: worker.mentalRfBoost,
   });
 
   const payload = buildCanonicalWorkerPayload(worker, {
@@ -1495,6 +1650,8 @@ export async function importWorkersBatch(
       shiftHours: existing?.shiftHours,
       mq3Status: existing?.mq3Status,
       baselineHr,
+      mentalRfBoost: existing?.mentalRfBoost,
+      mentalStrainLevel: existing?.mentalStrainLevel,
     });
 
     const ref = doc(db, 'workers', id);
@@ -1546,6 +1703,10 @@ export async function importWorkersBatch(
         riskFactor: dyn.riskFactor,
         dynamicHrY: dyn.thresholds.hrY,
         dynamicHrR: dyn.thresholds.hrR,
+        mentalStrainLevel: 'calm',
+        mentalRfBoost: 0,
+        mentalAdjustedAt: null,
+        workerUid: null,
         condition: 'unlinked',
         reasons: ['Band paired — awaiting live sensor report'],
         lastReport: null,
@@ -1720,6 +1881,8 @@ export async function recordTelemetryReport(
       shiftHours,
       baselineHr: worker.baselineHr,
       loadFactor: worker.loadFactor,
+      mentalRfBoost: worker.mentalRfBoost,
+      mentalStrainLevel: worker.mentalStrainLevel,
     },
   );
 
@@ -1769,6 +1932,8 @@ export async function recordTelemetryReport(
     leadOff,
     condition,
     lastReport: snapshot,
+    mentalStrainLevel: worker.mentalStrainLevel,
+    mentalRfBoost: worker.mentalRfBoost,
   });
 
   const ownerUid = worker.ownerUid || user.uid;
@@ -1860,6 +2025,10 @@ export async function createSingleWorkerDirect(
       riskFactor: dyn.riskFactor,
       dynamicHrY: dyn.thresholds.hrY,
       dynamicHrR: dyn.thresholds.hrR,
+      mentalStrainLevel: 'calm',
+      mentalRfBoost: 0,
+      mentalAdjustedAt: null,
+      workerUid: null,
       condition: 'unlinked',
       reasons: ['Band paired — awaiting live sensor report'],
       lastReport: null,
@@ -1869,5 +2038,260 @@ export async function createSingleWorkerDirect(
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, `workers/${id}`);
+  }
+}
+
+// =============================================================================
+// Worker-Only Zero-Leak Private Vault (JaanSaathi Companion)
+// Strict Firestore Enforcement: ONLY request.auth.uid == workerUid can read/write.
+// Private messages NEVER leave /worker_private/{uid}. Only anonymized Rf/Fit status syncs to workers/{id}.
+// =============================================================================
+
+export function subscribeWorkerPrivateVault(
+  user: User,
+  onVault: (vault: WorkerPrivateVault | null) => void,
+  onCheckins: (checkins: WorkerPrivateCheckin[]) => void,
+  onError: (err: Error) => void,
+): Unsubscribe {
+  const vaultRef = doc(db, 'worker_private', user.uid);
+  const checkinsQ = query(
+    collection(db, 'worker_private', user.uid, 'checkins'),
+    orderBy('createdAt', 'desc'),
+    limit(25),
+  );
+
+  const unsubVault = onSnapshot(
+    vaultRef,
+    (snap) => {
+      if (!snap.exists()) {
+        onVault(null);
+        return;
+      }
+      const d = snap.data() as Record<string, unknown>;
+      onVault({
+        workerUid: user.uid,
+        workerId: typeof d.workerId === 'string' ? d.workerId : '',
+        preferredLanguageCode:
+          typeof d.preferredLanguageCode === 'string' ? d.preferredLanguageCode : 'hi',
+        preferredState: typeof d.preferredState === 'string' ? d.preferredState : 'Pan-India',
+        lastMentalStrainLevel: normalizeMentalStrain(d.lastMentalStrainLevel),
+        lastMentalRfBoost: clampFinite(d.lastMentalRfBoost, 0, 0.25) ?? 0,
+        updatedAt: timestampToIso(d.updatedAt),
+      });
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, `worker_private/${user.uid}`);
+      } catch (wrapped) {
+        onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
+  const unsubCheckins = onSnapshot(
+    checkinsQ,
+    (snap) => {
+      const list: WorkerPrivateCheckin[] = snap.docs.map((d) => {
+        const raw = d.data() as Record<string, unknown>;
+        const moodRaw = String(raw.buddyMood || 'warm');
+        const buddyMood: BuddyMood =
+          moodRaw === 'listening' ||
+          moodRaw === 'encouraging' ||
+          moodRaw === 'caring' ||
+          moodRaw === 'alert'
+            ? moodRaw
+            : 'warm';
+        return {
+          id: d.id,
+          workerUid: user.uid,
+          workerId: typeof raw.workerId === 'string' ? raw.workerId : '',
+          languageCode: typeof raw.languageCode === 'string' ? raw.languageCode : 'hi',
+          languageName: typeof raw.languageName === 'string' ? raw.languageName : 'Hindi',
+          workerMessage: typeof raw.workerMessage === 'string' ? raw.workerMessage : '',
+          buddyReply: typeof raw.buddyReply === 'string' ? raw.buddyReply : '',
+          buddyMood,
+          mentalStrainLevel: normalizeMentalStrain(raw.mentalStrainLevel),
+          mentalRfBoost: clampFinite(raw.mentalRfBoost, 0, 0.25) ?? 0,
+          gentleCareTip: typeof raw.gentleCareTip === 'string' ? raw.gentleCareTip : '',
+          syncedToBand: Boolean(raw.syncedToBand),
+          createdAt: timestampToIso(raw.createdAt),
+        };
+      });
+      onCheckins(list);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(
+          error,
+          OperationType.LIST,
+          `worker_private/${user.uid}/checkins`,
+        );
+      } catch (wrapped) {
+        onError(wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      }
+    },
+  );
+
+  return () => {
+    unsubVault();
+    unsubCheckins();
+  };
+}
+
+export async function saveWorkerLanguagePref(
+  user: User,
+  params: {
+    workerId?: string;
+    preferredLanguageCode: string;
+    preferredState: string;
+  },
+): Promise<void> {
+  const ref = doc(db, 'worker_private', user.uid);
+  try {
+    await setDoc(
+      ref,
+      {
+        workerUid: user.uid,
+        workerId: sanitizeId(params.workerId || '', 64),
+        preferredLanguageCode: sanitizeText(params.preferredLanguageCode, 16) || 'hi',
+        preferredState: sanitizeText(params.preferredState, 64) || 'Pan-India',
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true },
+    );
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `worker_private/${user.uid}`);
+  }
+}
+
+export async function recordPrivateCheckinAndSyncAnonymizedRf(
+  user: User,
+  params: {
+    worker: WorkerRecord | null;
+    preferredState: string;
+    languageCode: string;
+    languageName: string;
+    workerMessage: string;
+    buddyReply: string;
+    buddyMood: BuddyMood;
+    mentalStrainLevel: MentalStrainLevel;
+    mentalRfBoost: number;
+    gentleCareTip: string;
+    recommendShadedDuty?: boolean;
+    recommendMedicalHold?: boolean;
+  },
+): Promise<void> {
+  const checkinId =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `chk-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  const boost = Number((clampFinite(params.mentalRfBoost, 0, 0.25) ?? 0).toFixed(2));
+  const strain: MentalStrainLevel = normalizeMentalStrain(
+    params.recommendMedicalHold
+      ? 'rest_advised'
+      : params.recommendShadedDuty && params.mentalStrainLevel === 'calm'
+        ? 'strained'
+        : params.mentalStrainLevel,
+  );
+  const effectiveBoost =
+    strain === 'rest_advised'
+      ? Math.max(0.2, boost)
+      : strain === 'strained'
+        ? Math.max(0.12, boost)
+        : boost;
+
+  const vaultRef = doc(db, 'worker_private', user.uid);
+  const checkinRef = doc(db, 'worker_private', user.uid, 'checkins', checkinId);
+  const workerId = params.worker?.id || '';
+
+  const batch = writeBatch(db);
+  batch.set(
+    vaultRef,
+    {
+      workerUid: user.uid,
+      workerId,
+      preferredLanguageCode: sanitizeText(params.languageCode, 16) || 'hi',
+      preferredState: sanitizeText(params.preferredState, 64) || 'Pan-India',
+      lastMentalStrainLevel: strain,
+      lastMentalRfBoost: effectiveBoost,
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  batch.set(checkinRef, {
+    id: checkinId,
+    workerUid: user.uid,
+    workerId,
+    languageCode: sanitizeText(params.languageCode, 16) || 'hi',
+    languageName: sanitizeText(params.languageName, 64) || 'Hindi',
+    workerMessage: sanitizeText(params.workerMessage, 2000) || 'Check-in',
+    buddyReply: sanitizeText(params.buddyReply, 2500) || 'Stay safe and hydrated.',
+    buddyMood: params.buddyMood,
+    mentalStrainLevel: strain,
+    mentalRfBoost: effectiveBoost,
+    gentleCareTip: sanitizeText(params.gentleCareTip, 400),
+    syncedToBand: Boolean(params.worker),
+    createdAt: serverTimestamp(),
+  });
+
+  if (params.worker) {
+    const w = params.worker;
+    const dyn = computeDynamicRiskProfile({
+      age: w.age,
+      conditions: w.conditions,
+      restingBp: w.restingBp,
+      daysOnSite: w.daysOnSite,
+      readiness: w.readiness,
+      shiftHours: w.shiftHours,
+      mq3Status: w.mq3Status,
+      baselineHr: w.baselineHr,
+      loadFactor: w.loadFactor,
+      mentalRfBoost: effectiveBoost,
+      mentalStrainLevel: strain,
+    });
+    const fit = evaluateFitToWork({
+      workerId: w.id,
+      restingBp: w.restingBp,
+      baselineHr: w.baselineHr,
+      daysOnSite: w.daysOnSite,
+      dutyZone: w.dutyZone,
+      readiness: w.readiness,
+      gaitBalance: w.gaitBalance,
+      mq3Status: w.mq3Status,
+      mq3MgL: w.mq3MgL,
+      shiftStartHr: w.shiftStartHr,
+      shiftHours: w.shiftHours,
+      leadOff: w.leadOff,
+      condition: w.condition,
+      lastReport: w.lastReport,
+      mentalStrainLevel: strain,
+      mentalRfBoost: effectiveBoost,
+    });
+
+    const workerRef = doc(db, 'workers', w.id);
+    // Anonymized update ONLY: zero private words or health disclosures sent to workers/{id}
+    batch.update(workerRef, {
+      mentalStrainLevel: strain,
+      mentalRfBoost: effectiveBoost,
+      mentalAdjustedAt: new Date().toISOString(),
+      fitStatus: fit.status,
+      fitReasons: fit.reasons.map((r) => sanitizeText(r, 160)).filter(Boolean).slice(0, 10),
+      riskFactor: dyn.riskFactor,
+      dynamicHrY: dyn.thresholds.hrY,
+      dynamicHrR: dyn.thresholds.hrR,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.WRITE,
+      `worker_private/${user.uid}/checkins/${checkinId}`,
+    );
   }
 }
