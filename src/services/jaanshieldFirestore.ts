@@ -6,7 +6,6 @@ import {
   query,
   serverTimestamp,
   setDoc,
-  updateDoc,
   where,
   writeBatch,
   type Timestamp,
@@ -15,6 +14,7 @@ import {
 import type { User } from 'firebase/auth';
 import {
   OperationType,
+  auth,
   db,
   handleFirestoreError,
   isAdminUser,
@@ -22,11 +22,23 @@ import {
 import {
   ConditionLevel,
   DEFAULT_THRESHOLDS,
+  DutyZone,
+  DynamicRiskProfile,
+  FitToWorkEvaluation,
+  FitToWorkStatus,
+  GaitBalanceStatus,
+  KeepAliveStatus,
+  MountMode,
+  Mq3Status,
   TelemetryReport,
   TelemetrySource,
   ThresholdConfig,
+  WorkerConditions,
+  WorkerReadiness,
   WorkerRecord,
 } from '../types/band';
+
+export const KEEP_ALIVE_TIMEOUT_SECONDS = 15;
 
 export function sanitizeId(raw: string, maxLen = 32): string {
   return raw
@@ -46,6 +58,19 @@ export function sanitizeText(raw: unknown, maxLen: number): string {
     .slice(0, maxLen);
 }
 
+export function sanitizeBp(raw: unknown): string {
+  if (typeof raw !== 'string') return '120/80';
+  const cleaned = raw.trim().replace(/[^0-9/]/g, '').slice(0, 16);
+  return /^[0-9]{2,3}\/[0-9]{2,3}$/.test(cleaned) ? cleaned : '120/80';
+}
+
+export function sanitizeIsoTimestamp(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (trimmed.length < 10 || trimmed.length > 40) return null;
+  return trimmed;
+}
+
 export function clampFinite(
   raw: unknown,
   min: number,
@@ -57,26 +82,319 @@ export function clampFinite(
   return Math.min(max, Math.max(min, num));
 }
 
+export function normalizeConditions(raw: unknown): WorkerConditions {
+  if (!raw || typeof raw !== 'object') {
+    return { hypertension: false, diabetes: false, priorHeat: false };
+  }
+  const obj = raw as Record<string, unknown>;
+  return {
+    hypertension: Boolean(obj.hypertension),
+    diabetes: Boolean(obj.diabetes),
+    priorHeat: Boolean(obj.priorHeat),
+  };
+}
+
+export function parseRestingBp(raw: unknown): {
+  systolic: number;
+  diastolic: number;
+} {
+  const safe = sanitizeBp(raw);
+  const [s, d] = safe.split('/').map((n) => Number(n));
+  return {
+    systolic: Number.isFinite(s) ? s : 120,
+    diastolic: Number.isFinite(d) ? d : 80,
+  };
+}
+
+export function normalizeReadiness(raw: unknown): WorkerReadiness {
+  if (!raw || typeof raw !== 'object') {
+    return { lowSleep: false, sedatingMeds: false, dizzyOrUnwell: false };
+  }
+  const obj = raw as Record<string, unknown>;
+  return {
+    lowSleep: Boolean(obj.lowSleep),
+    sedatingMeds: Boolean(obj.sedatingMeds),
+    dizzyOrUnwell: Boolean(obj.dizzyOrUnwell),
+  };
+}
+
+export function computeDynamicRiskProfile(profile: {
+  age?: number;
+  conditions?: WorkerConditions;
+  restingBp?: string;
+  daysOnSite?: number;
+  readiness?: WorkerReadiness;
+  shiftHours?: number;
+  mq3Status?: Mq3Status;
+  baselineHr?: number;
+  loadFactor?: number;
+}): DynamicRiskProfile {
+  const age = clampFinite(profile.age, 18, 85) ?? 30;
+  const conditions = profile.conditions ?? {
+    hypertension: false,
+    diabetes: false,
+    priorHeat: false,
+  };
+  const readiness = profile.readiness ?? {
+    lowSleep: false,
+    sedatingMeds: false,
+    dizzyOrUnwell: false,
+  };
+  const { systolic, diastolic } = parseRestingBp(profile.restingBp);
+  const daysOnSite = clampFinite(profile.daysOnSite, 1, 3650) ?? 14;
+  const shiftHours = clampFinite(profile.shiftHours, 0, 24) ?? 0;
+  const loadFactor = clampFinite(profile.loadFactor, 0.1, 2.0) ?? 0.5;
+  const mq3Status: Mq3Status = profile.mq3Status ?? 'pending';
+
+  let rf = 1.0;
+  const riskTags: string[] = [];
+
+  if (age >= 55) {
+    rf += 0.14;
+    riskTags.push(`Age ${age} (High CV Weight)`);
+  } else if (age >= 45) {
+    rf += 0.1;
+    riskTags.push(`Age ${age} (45+ CV Weight)`);
+  }
+
+  if (conditions.hypertension) {
+    rf += 0.12;
+    riskTags.push('Hypertension');
+  } else if (systolic >= 160 || diastolic >= 100) {
+    rf += 0.12;
+    riskTags.push(`Morning BP ${systolic}/${diastolic}`);
+  } else if (systolic >= 140 || diastolic >= 90) {
+    rf += 0.06;
+    riskTags.push(`Elevated BP ${systolic}/${diastolic}`);
+  }
+
+  if (conditions.diabetes) {
+    rf += 0.08;
+    riskTags.push('Diabetes');
+  }
+  if (conditions.priorHeat) {
+    rf += 0.08;
+    riskTags.push('Prior Heat History');
+  }
+
+  if (daysOnSite < 7) {
+    rf += 0.08;
+    riskTags.push(`Day ${daysOnSite} Unacclimatized`);
+  }
+
+  if (readiness.lowSleep) {
+    rf += 0.05;
+    riskTags.push('<5h Sleep Debt');
+  }
+
+  if (loadFactor > 1.2) {
+    rf += 0.04;
+    riskTags.push('Heavy Load Tier');
+  }
+
+  const fatigueMultiplierActive = shiftHours >= 4;
+  if (fatigueMultiplierActive) {
+    rf += 0.07;
+    riskTags.push(`${shiftHours.toFixed(1)}h Shift Fatigue`);
+  }
+
+  if (mq3Status === 'flagged') {
+    rf += 0.1;
+    riskTags.push('Breath Alcohol Flag');
+  }
+
+  const riskFactor = Number(Math.min(2.5, rf).toFixed(2));
+  const hrR = Math.max(100, Math.round(DEFAULT_THRESHOLDS.hrR / riskFactor));
+  const hrY = Math.min(
+    hrR - 12,
+    Math.max(88, Math.round(DEFAULT_THRESHOLDS.hrY / riskFactor)),
+  );
+  const tR = Number(
+    (
+      DEFAULT_THRESHOLDS.tR -
+      (conditions.priorHeat ? 0.4 : 0) -
+      (mq3Status === 'flagged' ? 0.3 : 0) -
+      (daysOnSite < 7 ? 0.2 : 0)
+    ).toFixed(1),
+  );
+  const tY = Number(
+    (
+      DEFAULT_THRESHOLDS.tY -
+      (conditions.priorHeat ? 0.3 : 0) -
+      (mq3Status === 'flagged' ? 0.2 : 0) -
+      (daysOnSite < 7 ? 0.2 : 0)
+    ).toFixed(1),
+  );
+
+  return {
+    riskFactor,
+    fatigueMultiplierActive,
+    riskTags,
+    thresholds: {
+      ...DEFAULT_THRESHOLDS,
+      hrY,
+      hrR,
+      tY,
+      tR,
+      brk: fatigueMultiplierActive ? 90 : DEFAULT_THRESHOLDS.brk,
+    },
+  };
+}
+
+export function getKeepAliveStatus(
+  worker: Pick<
+    WorkerRecord,
+    'id' | 'bandId' | 'leadOff' | 'lastKeepAliveAt' | 'lastReport'
+  > | null,
+  nowMs = Date.now(),
+): KeepAliveStatus {
+  if (!worker || !worker.bandId) {
+    return {
+      state: 'standby',
+      secondsElapsed: null,
+      secondsRemaining: null,
+      reason: 'No JaanBand paired',
+    };
+  }
+
+  if (worker.leadOff) {
+    return {
+      state: 'disconnected',
+      secondsElapsed: null,
+      secondsRemaining: 0,
+      reason: `Worker #${worker.id}: Device Disconnected / Mechanical Failure (Optical Lead-Off)`,
+    };
+  }
+
+  const refIso = worker.lastKeepAliveAt || worker.lastReport?.timestamp || null;
+  if (!refIso) {
+    return {
+      state: 'standby',
+      secondsElapsed: null,
+      secondsRemaining: null,
+      reason: 'Awaiting initial Keep-Alive packet',
+    };
+  }
+
+  const parsedMs = Date.parse(refIso);
+  if (!Number.isFinite(parsedMs)) {
+    return {
+      state: 'standby',
+      secondsElapsed: null,
+      secondsRemaining: null,
+      reason: 'Awaiting initial Keep-Alive packet',
+    };
+  }
+
+  const elapsedSec = Math.max(0, Math.floor((nowMs - parsedMs) / 1000));
+  if (elapsedSec > KEEP_ALIVE_TIMEOUT_SECONDS) {
+    return {
+      state: 'disconnected',
+      secondsElapsed: elapsedSec,
+      secondsRemaining: 0,
+      reason: `Worker #${worker.id}: Device Disconnected / Mechanical Failure (${elapsedSec}s since keep-alive)`,
+    };
+  }
+
+  return {
+    state: 'alive',
+    secondsElapsed: elapsedSec,
+    secondsRemaining: Math.max(0, KEEP_ALIVE_TIMEOUT_SECONDS - elapsedSec),
+    reason: `Keep-Alive verified (${elapsedSec}s / ${KEEP_ALIVE_TIMEOUT_SECONDS}s window)`,
+  };
+}
+
 export function evaluateCondition(
   report: {
     bpm: number;
     spo2: number;
     skinTempC: number;
+    hrvMs?: number | null;
     heatIndexC: number | null;
+    perfusionIndex?: number | null;
+    batteryPct?: number | null;
     minutesSinceBreak: number;
+    tremorHz?: number | null;
+    hrrBpmDrop?: number | null;
+    shiftHours?: number | null;
+    leadOff?: boolean;
   },
-  thresholds: ThresholdConfig = DEFAULT_THRESHOLDS,
-): { condition: Exclude<ConditionLevel, 'unlinked'>; reasons: string[] } {
+  workerContext?: {
+    workerId?: string;
+    age?: number;
+    conditions?: WorkerConditions;
+    restingBp?: string;
+    daysOnSite?: number;
+    dutyZone?: DutyZone;
+    readiness?: WorkerReadiness;
+    gaitBalance?: GaitBalanceStatus;
+    mq3Status?: Mq3Status;
+    shiftStartHr?: number | null;
+    shiftHours?: number;
+    baselineHr?: number;
+    loadFactor?: number;
+  },
+): {
+  condition: Exclude<ConditionLevel, 'unlinked'>;
+  reasons: string[];
+  thresholds: ThresholdConfig;
+  riskFactor: number;
+} {
+  const effectiveShiftHours = report.shiftHours ?? workerContext?.shiftHours ?? 0;
+  const baselineHr = workerContext?.baselineHr ?? 74;
+  const daysOnSite = workerContext?.daysOnSite ?? 14;
+  const dutyZone: DutyZone = workerContext?.dutyZone ?? 'heavy_sun';
+  const readiness = workerContext?.readiness ?? {
+    lowSleep: false,
+    sedatingMeds: false,
+    dizzyOrUnwell: false,
+  };
+  const gaitBalance: GaitBalanceStatus = workerContext?.gaitBalance ?? 'pending';
+  const { systolic, diastolic } = parseRestingBp(workerContext?.restingBp);
+
+  const profile = computeDynamicRiskProfile({
+    age: workerContext?.age,
+    conditions: workerContext?.conditions,
+    restingBp: workerContext?.restingBp,
+    daysOnSite,
+    readiness,
+    shiftHours: effectiveShiftHours,
+    mq3Status: workerContext?.mq3Status,
+    baselineHr,
+    loadFactor: workerContext?.loadFactor,
+  });
+  const thresholds = profile.thresholds;
   const criticalReasons: string[] = [];
   const cautionReasons: string[] = [];
 
-  if (report.bpm >= thresholds.hrR) {
+  if (report.leadOff) {
     criticalReasons.push(
-      `Heart rate critical (${report.bpm} >= ${thresholds.hrR} bpm)`,
+      `Worker #${workerContext?.workerId || 'BAND'}: Device Disconnected / Mechanical Failure (Lead-Off)`,
     );
-  } else if (report.bpm >= thresholds.hrY) {
+  }
+
+  if (systolic >= 160 || diastolic >= 100) {
+    criticalReasons.push(
+      `Uncontrolled morning BP (${systolic}/${diastolic} >= 160/100 mmHg)`,
+    );
+  } else if (systolic >= 140 || diastolic >= 90) {
     cautionReasons.push(
-      `Heart rate elevated (${report.bpm} >= ${thresholds.hrY} bpm)`,
+      `Elevated resting BP (${systolic}/${diastolic} >= 140/90 mmHg)`,
+    );
+  }
+
+  if (readiness.dizzyOrUnwell) {
+    criticalReasons.push('Pre-shift dizziness / acute unwell flag — Medical Hold');
+  }
+
+  const hrDelta = report.bpm - baselineHr;
+  if (report.bpm >= thresholds.hrR || hrDelta >= 75) {
+    criticalReasons.push(
+      `Heart rate critical (${report.bpm} bpm · +${Math.max(0, hrDelta)} over ${baselineHr} rest · Rf ${profile.riskFactor})`,
+    );
+  } else if (report.bpm >= thresholds.hrY || hrDelta >= 55) {
+    cautionReasons.push(
+      `Heart rate elevated (${report.bpm} bpm · +${Math.max(0, hrDelta)} over rest · Rf ${profile.riskFactor})`,
     );
   }
 
@@ -90,7 +408,11 @@ export function evaluateCondition(
     );
   }
 
-  if (report.skinTempC >= thresholds.tR) {
+  if (report.skinTempC >= 37.3) {
+    criticalReasons.push(
+      `Fever / acute thermal threshold (${report.skinTempC.toFixed(1)}°C >= 37.3°C)`,
+    );
+  } else if (report.skinTempC >= thresholds.tR) {
     criticalReasons.push(
       `Skin temp critical (${report.skinTempC.toFixed(1)}°C >= ${thresholds.tR}°C)`,
     );
@@ -112,22 +434,304 @@ export function evaluateCondition(
     }
   }
 
+  // Perfusion Index peripheral dehydration / vasoconstriction check
+  if (report.perfusionIndex !== null && report.perfusionIndex !== undefined) {
+    if (report.perfusionIndex < 0.35) {
+      criticalReasons.push(
+        `Severe low perfusion / dehydration shock (PI ${report.perfusionIndex.toFixed(2)}% < 0.35%)`,
+      );
+    } else if (report.perfusionIndex < 0.8) {
+      cautionReasons.push(
+        `Low perfusion index / dehydration strain (PI ${report.perfusionIndex.toFixed(2)}% < 0.8%)`,
+      );
+    }
+  }
+
+  // Cognitive fatigue & mental stress via RMSSD HRV
+  if (report.hrvMs !== null && report.hrvMs !== undefined) {
+    if (report.hrvMs < 20) {
+      criticalReasons.push(
+        `Severe autonomic stress / low HRV (${report.hrvMs} ms RMSSD)`,
+      );
+    } else if (report.hrvMs < 32) {
+      cautionReasons.push(
+        `Mental stress & cognitive fatigue (HRV ${report.hrvMs} ms RMSSD)`,
+      );
+    }
+  }
+
+  if (daysOnSite < 7 && (dutyZone === 'heavy_sun' || (report.heatIndexC ?? 0) >= 35)) {
+    cautionReasons.push(
+      `Unacclimatized Day ${daysOnSite} (<7d) — restrict from direct sun / full load`,
+    );
+  }
+
+  if (gaitBalance === 'sway') {
+    if (dutyZone === 'height') {
+      criticalReasons.push('IMU balance sway detected — disqualified from Height duty');
+    } else {
+      cautionReasons.push('5s IMU gait/postural sway detected — shaded ground only');
+    }
+  }
+
+  if (readiness.lowSleep || readiness.sedatingMeds) {
+    const flags = [
+      readiness.lowSleep ? '<5h sleep' : '',
+      readiness.sedatingMeds ? 'sedating meds' : '',
+    ]
+      .filter(Boolean)
+      .join(' + ');
+    if (dutyZone === 'height') {
+      criticalReasons.push(`Readiness hold (${flags}) — unsafe for Height/Scaffolding`);
+    } else {
+      cautionReasons.push(`Morning readiness caution (${flags})`);
+    }
+  }
+
+  if (report.batteryPct !== null && report.batteryPct !== undefined && report.batteryPct < 15) {
+    cautionReasons.push(`Low puck battery (${report.batteryPct}% < 15%) — swap from buffer`);
+  }
+
+  if (effectiveShiftHours >= 4) {
+    cautionReasons.push(
+      `Continuous shift fatigue (${effectiveShiftHours.toFixed(1)}h >= 4h limit)`,
+    );
+  }
+
   if (report.minutesSinceBreak >= thresholds.brk) {
     cautionReasons.push(`Rest break overdue (${report.minutesSinceBreak} min)`);
+  }
+
+  // Tier 1: Breath Alcohol Screening Flag (Band ePTFE Vent / Gate MQ-3)
+  if (workerContext?.mq3Status === 'flagged') {
+    if (dutyZone === 'height') {
+      criticalReasons.push('Breath alcohol flag — strictly barred from Height/Scaffold zone');
+    } else {
+      cautionReasons.push(
+        'Breath Flag: High Dehydration / Impairment Risk — Assign shaded task',
+      );
+    }
+  }
+
+  // Tier 2: Physiological Hangover / Withdrawal Fingerprint
+  const shiftStartHr = workerContext?.shiftStartHr ?? null;
+  if (shiftStartHr !== null && (shiftStartHr >= 95 || shiftStartHr - baselineHr >= 20)) {
+    cautionReasons.push(
+      `Morning resting tachycardia (${shiftStartHr} BPM vs ${baselineHr} rest) — dehydration risk`,
+    );
+  }
+
+  if (report.hrrBpmDrop !== null && report.hrrBpmDrop !== undefined && report.hrrBpmDrop < 12) {
+    cautionReasons.push(
+      `Abnormal 5m HR recovery (${report.hrrBpmDrop} BPM drop < 12 BPM)`,
+    );
+  }
+
+  if (report.tremorHz !== null && report.tremorHz !== undefined && report.tremorHz >= 6 && report.tremorHz <= 12) {
+    if (report.bpm >= thresholds.hrY || workerContext?.mq3Status === 'flagged' || dutyZone === 'height') {
+      criticalReasons.push(
+        `Withdrawal micro-tremors (${report.tremorHz.toFixed(1)} Hz) — Height/Load Medical Hold`,
+      );
+    } else {
+      cautionReasons.push(
+        `6–12 Hz wrist micro-tremors detected (${report.tremorHz.toFixed(1)} Hz)`,
+      );
+    }
   }
 
   if (criticalReasons.length > 0) {
     return {
       condition: 'critical',
       reasons: [...criticalReasons, ...cautionReasons].slice(0, 10),
+      thresholds,
+      riskFactor: profile.riskFactor,
     };
   }
   if (cautionReasons.length > 0) {
-    return { condition: 'caution', reasons: cautionReasons.slice(0, 10) };
+    return {
+      condition: 'caution',
+      reasons: cautionReasons.slice(0, 10),
+      thresholds,
+      riskFactor: profile.riskFactor,
+    };
   }
   return {
     condition: 'normal',
-    reasons: ['All biometric thresholds within safe limits'],
+    reasons: [
+      `All vitals safe (Dynamic critical ceiling ${thresholds.hrR} BPM · Rf ${profile.riskFactor})`,
+    ],
+    thresholds,
+    riskFactor: profile.riskFactor,
+  };
+}
+
+export function evaluateFitToWork(input: {
+  workerId?: string;
+  restingBp?: string;
+  baselineHr?: number;
+  daysOnSite?: number;
+  dutyZone?: DutyZone;
+  readiness?: WorkerReadiness;
+  gaitBalance?: GaitBalanceStatus;
+  mq3Status?: Mq3Status;
+  mq3MgL?: number | null;
+  shiftStartHr?: number | null;
+  shiftHours?: number;
+  leadOff?: boolean;
+  condition?: ConditionLevel;
+  lastReport?: TelemetryReport | null;
+}): FitToWorkEvaluation {
+  const { systolic, diastolic } = parseRestingBp(input.restingBp);
+  const baselineHr = input.baselineHr ?? 74;
+  const daysOnSite = clampFinite(input.daysOnSite, 1, 3650) ?? 14;
+  const acclimatized = daysOnSite >= 7;
+  const dutyZone: DutyZone = input.dutyZone ?? 'heavy_sun';
+  const readiness = input.readiness ?? {
+    lowSleep: false,
+    sedatingMeds: false,
+    dizzyOrUnwell: false,
+  };
+  const gaitBalance: GaitBalanceStatus = input.gaitBalance ?? 'pending';
+  const report = input.lastReport ?? null;
+
+  const holdReasons: string[] = [];
+  const shadedReasons: string[] = [];
+
+  if (input.leadOff) {
+    holdReasons.push(
+      `Band disconnected / Lead-Off on ${input.workerId || 'worker'} — swap puck before deployment`,
+    );
+  }
+  if (systolic >= 160 || diastolic >= 100) {
+    holdReasons.push(`Morning BP ${systolic}/${diastolic} >= 160/100 mmHg (Hypertensive Hold)`);
+  } else if (systolic >= 140 || diastolic >= 90) {
+    shadedReasons.push(`Resting BP ${systolic}/${diastolic} >= 140/90 — shaded ground duty only`);
+  }
+
+  if (readiness.dizzyOrUnwell) {
+    holdReasons.push('Worker reports dizziness / acute unwellness');
+  }
+
+  if (report && report.skinTempC >= 37.3) {
+    holdReasons.push(`Elevated skin temp / fever (${report.skinTempC.toFixed(1)}°C >= 37.3°C)`);
+  }
+
+  if (report && report.perfusionIndex !== null && report.perfusionIndex < 0.35) {
+    holdReasons.push(`Severe low perfusion (${report.perfusionIndex.toFixed(2)}% < 0.35%) — shock/dehydration risk`);
+  } else if (report && report.perfusionIndex !== null && report.perfusionIndex < 0.8) {
+    shadedReasons.push(`Low perfusion (${report.perfusionIndex.toFixed(2)}% < 0.8%) — hydrate & shaded rotation`);
+  }
+
+  if (input.condition === 'critical' || report?.condition === 'critical') {
+    holdReasons.push(
+      report?.reasons?.[0] || 'Critical physiological telemetry alert active',
+    );
+  }
+
+  const hasTremor =
+    report?.tremorHz !== null &&
+    report?.tremorHz !== undefined &&
+    report.tremorHz >= 6 &&
+    report.tremorHz <= 12;
+
+  if (dutyZone === 'height') {
+    if (input.mq3Status === 'flagged') {
+      holdReasons.push('Height/Scaffold barred: Breath alcohol flag');
+    }
+    if (gaitBalance === 'sway') {
+      holdReasons.push('Height/Scaffold barred: 5s IMU gait/balance sway');
+    }
+    if (readiness.lowSleep || readiness.sedatingMeds) {
+      holdReasons.push('Height/Scaffold barred: <5h sleep or sedating medication');
+    }
+    if (hasTremor) {
+      holdReasons.push(`Height/Scaffold barred: ${report?.tremorHz?.toFixed(1)} Hz micro-tremors`);
+    }
+  } else {
+    if (input.mq3Status === 'flagged') {
+      if ((input.mq3MgL ?? 0) >= 0.4) {
+        holdReasons.push(`High breath alcohol (${(input.mq3MgL ?? 0).toFixed(2)} mg/L >= 0.40)`);
+      } else {
+        shadedReasons.push('Breath alcohol flagged — shaded low-intensity ground duty only');
+      }
+    }
+    if (gaitBalance === 'sway') {
+      shadedReasons.push('5s IMU gait sway — assign seated/ground shaded duty');
+    }
+    if (readiness.lowSleep) {
+      shadedReasons.push('<5h sleep reported — no heavy machinery or sun duty');
+    }
+    if (readiness.sedatingMeds) {
+      shadedReasons.push('Sedating/BP meds reported — avoid heavy heat & climb tasks');
+    }
+    if (hasTremor) {
+      shadedReasons.push(`6–12 Hz micro-tremors (${report?.tremorHz?.toFixed(1)} Hz) — rest & monitor`);
+    }
+  }
+
+  if (!acclimatized && (dutyZone === 'heavy_sun' || (report?.heatIndexC ?? 0) >= 35)) {
+    shadedReasons.push(`Day ${daysOnSite} unacclimatized (<7d) — shaded ramp-in duty required`);
+  }
+
+  if (
+    input.shiftStartHr !== null &&
+    input.shiftStartHr !== undefined &&
+    (input.shiftStartHr >= 95 || input.shiftStartHr - baselineHr >= 20)
+  ) {
+    shadedReasons.push(
+      `Morning resting tachycardia (${input.shiftStartHr} BPM) — pre-shift hydration + shade`,
+    );
+  }
+
+  if (report?.batteryPct !== null && report?.batteryPct !== undefined && report.batteryPct < 15) {
+    shadedReasons.push(`Band battery ${report.batteryPct}% (<15%) — swap puck from 10% buffer`);
+  }
+
+  if (report?.hrrBpmDrop !== null && report?.hrrBpmDrop !== undefined && report.hrrBpmDrop < 12) {
+    shadedReasons.push(`Slow 5m HR recovery (${report.hrrBpmDrop} < 12 BPM) — extend rest break`);
+  }
+
+  if (input.condition === 'caution' || report?.condition === 'caution') {
+    if (shadedReasons.length === 0) {
+      shadedReasons.push(report?.reasons?.[0] || 'Caution telemetry limit active — shaded duty');
+    }
+  }
+
+  if (holdReasons.length > 0) {
+    return {
+      status: 'medical_hold',
+      reasons: [...holdReasons, ...shadedReasons].slice(0, 10),
+      bpSystolic: systolic,
+      bpDiastolic: diastolic,
+      acclimatized,
+    };
+  }
+
+  if (shadedReasons.length > 0) {
+    return {
+      status: 'shaded_only',
+      reasons: shadedReasons.slice(0, 10),
+      bpSystolic: systolic,
+      bpDiastolic: diastolic,
+      acclimatized,
+    };
+  }
+
+  const zoneText =
+    dutyZone === 'height'
+      ? 'Height/Scaffold'
+      : dutyZone === 'heavy_sun'
+        ? 'Direct Sun/Heavy'
+        : 'Shaded Ground';
+
+  return {
+    status: 'fit_full',
+    reasons: [
+      `Cleared for ${zoneText} · BP ${systolic}/${diastolic} · Day ${daysOnSite} ${acclimatized ? 'acclimatized' : 'ramp'}`,
+    ],
+    bpSystolic: systolic,
+    bpDiastolic: diastolic,
+    acclimatized,
   };
 }
 
@@ -143,57 +747,283 @@ function timestampToIso(val: unknown): string {
   return new Date().toISOString();
 }
 
-function mapDocToWorker(data: Record<string, unknown>): WorkerRecord {
+function mapDocToWorker(
+  docId: string,
+  data: Record<string, unknown>,
+): WorkerRecord {
   const lastRaw =
     data.lastReport && typeof data.lastReport === 'object'
       ? (data.lastReport as Record<string, unknown>)
       : null;
 
+  const rawSource = String(lastRaw?.source || 'api');
+  const safeSource: TelemetrySource =
+    rawSource === 'ble' || rawSource === 'manual' ? rawSource : 'api';
+  const resolvedWorkerId = sanitizeId(String(data.id || docId || ''), 32) || docId;
+  const safeWorkerId =
+    sanitizeId(String(lastRaw?.workerId || resolvedWorkerId), 32) || resolvedWorkerId;
+  const safeRepBand =
+    sanitizeId(String(lastRaw?.bandId || data.bandId || `JB-MK4-${safeWorkerId}`), 48) ||
+    `JB-MK4-${safeWorkerId}`;
+  const rawReasons = Array.isArray(lastRaw?.reasons)
+    ? lastRaw.reasons.map((r) => sanitizeText(String(r), 160)).filter(Boolean).slice(0, 10)
+    : [];
+
   const lastReport: TelemetryReport | null = lastRaw
     ? {
-        id: String(lastRaw.id || ''),
-        workerId: String(lastRaw.workerId || data.id || ''),
-        bandId: String(lastRaw.bandId || data.bandId || ''),
-        bpm: Number(lastRaw.bpm || 0),
-        spo2: Number(lastRaw.spo2 || 0),
-        skinTempC: Number(lastRaw.skinTempC || 0),
-        hrvMs: lastRaw.hrvMs !== null && lastRaw.hrvMs !== undefined ? Number(lastRaw.hrvMs) : null,
-        heatIndexC:
-          lastRaw.heatIndexC !== null && lastRaw.heatIndexC !== undefined
-            ? Number(lastRaw.heatIndexC)
-            : null,
-        perfusionIndex:
-          lastRaw.perfusionIndex !== null && lastRaw.perfusionIndex !== undefined
-            ? Number(lastRaw.perfusionIndex)
-            : null,
-        batteryPct:
-          lastRaw.batteryPct !== null && lastRaw.batteryPct !== undefined
-            ? Number(lastRaw.batteryPct)
-            : null,
-        minutesSinceBreak: Number(lastRaw.minutesSinceBreak || 0),
-        condition: (lastRaw.condition as TelemetryReport['condition']) || 'normal',
-        reasons: Array.isArray(lastRaw.reasons)
-          ? lastRaw.reasons.map((r) => String(r)).slice(0, 10)
-          : ['Live telemetry report'],
-        source: (lastRaw.source as TelemetrySource) || 'api',
-        timestamp: String(lastRaw.timestamp || new Date().toISOString()),
+        id: sanitizeId(String(lastRaw.id || `rep-${Date.now()}`), 64) || `rep-${Date.now()}`,
+        workerId: safeWorkerId,
+        bandId: safeRepBand,
+        bpm: clampFinite(lastRaw.bpm, 25, 240) ?? 74,
+        spo2: clampFinite(lastRaw.spo2, 50, 100) ?? 98,
+        skinTempC: clampFinite(lastRaw.skinTempC, 25, 45) ?? 35,
+        hrvMs: clampFinite(lastRaw.hrvMs, 0, 300),
+        heatIndexC: clampFinite(lastRaw.heatIndexC, -20, 75),
+        perfusionIndex: clampFinite(lastRaw.perfusionIndex, 0, 25),
+        batteryPct: clampFinite(lastRaw.batteryPct, 0, 100),
+        tremorHz: clampFinite(lastRaw.tremorHz, 0, 30),
+        hrrBpmDrop: clampFinite(lastRaw.hrrBpmDrop, 0, 80),
+        shiftHours: clampFinite(lastRaw.shiftHours, 0, 24),
+        leadOff: Boolean(lastRaw.leadOff),
+        mq3Flag: Boolean(lastRaw.mq3Flag),
+        minutesSinceBreak: Math.round(clampFinite(lastRaw.minutesSinceBreak, 0, 1440) ?? 0),
+        condition:
+          lastRaw.condition === 'caution' || lastRaw.condition === 'critical'
+            ? lastRaw.condition
+            : 'normal',
+        reasons: rawReasons.length > 0 ? rawReasons : ['Live telemetry report'],
+        source: safeSource,
+        timestamp:
+          typeof lastRaw.timestamp === 'string' && lastRaw.timestamp.length >= 10
+            ? lastRaw.timestamp.slice(0, 40)
+            : new Date().toISOString(),
       }
     : null;
 
+  const age = clampFinite(data.age, 18, 85) ?? 30;
+  const conditions = normalizeConditions(data.conditions);
+  const restingBp = sanitizeBp(data.restingBp);
+  const daysOnSite = Math.round(clampFinite(data.daysOnSite, 1, 3650) ?? 14);
+  const dutyZone: DutyZone =
+    data.dutyZone === 'height' || data.dutyZone === 'shaded'
+      ? data.dutyZone
+      : 'heavy_sun';
+  const readiness = normalizeReadiness(data.readiness);
+  const gaitBalance: GaitBalanceStatus =
+    data.gaitBalance === 'stable' || data.gaitBalance === 'sway'
+      ? data.gaitBalance
+      : 'pending';
+  const shiftHours = clampFinite(data.shiftHours, 0, 24) ?? 0;
+  const loadFactor = clampFinite(data.loadFactor, 0.1, 2.0) ?? 0.5;
+  const mq3Status: Mq3Status =
+    data.mq3Status === 'clear' || data.mq3Status === 'flagged'
+      ? data.mq3Status
+      : 'pending';
+  const mq3MgL = clampFinite(data.mq3MgL, 0, 2.5);
+  const baselineHr = clampFinite(data.baselineHr, 40, 140) ?? 74;
+  const shiftStartHr = clampFinite(data.shiftStartHr, 30, 200);
+  const leadOff = Boolean(data.leadOff);
+  const condition = (data.condition as ConditionLevel) || 'unlinked';
+
+  const computedProfile = computeDynamicRiskProfile({
+    age,
+    conditions,
+    restingBp,
+    daysOnSite,
+    readiness,
+    shiftHours,
+    mq3Status,
+    baselineHr,
+    loadFactor,
+  });
+
+  const computedFit = evaluateFitToWork({
+    workerId: resolvedWorkerId,
+    restingBp,
+    baselineHr,
+    daysOnSite,
+    dutyZone,
+    readiness,
+    gaitBalance,
+    mq3Status,
+    mq3MgL,
+    shiftStartHr,
+    shiftHours,
+    leadOff,
+    condition,
+    lastReport,
+  });
+
+  const fitStatus: FitToWorkStatus =
+    data.fitStatus === 'fit_full' ||
+    data.fitStatus === 'shaded_only' ||
+    data.fitStatus === 'medical_hold'
+      ? data.fitStatus
+      : computedFit.status;
+
+  const fitReasons = Array.isArray(data.fitReasons) && data.fitReasons.length > 0
+    ? data.fitReasons.map((r) => String(r)).slice(0, 10)
+    : computedFit.reasons;
+
+  const mountMode: MountMode =
+    data.mountMode === 'bicep' || data.mountMode === 'helmet'
+      ? data.mountMode
+      : 'wrist';
+
   return {
-    id: String(data.id || ''),
-    name: String(data.name || ''),
+    id: resolvedWorkerId,
+    name: String(data.name || resolvedWorkerId),
     role: String(data.role || 'Site Worker'),
     bandId: String(data.bandId || ''),
-    baselineHr: Number(data.baselineHr || 74),
-    loadFactor: Number(data.loadFactor || 0.5),
-    condition: (data.condition as ConditionLevel) || 'unlinked',
+    baselineHr,
+    loadFactor,
+    age,
+    conditions,
+    restingBp,
+    mountMode,
+    daysOnSite,
+    dutyZone,
+    readiness,
+    gaitBalance,
+    fitStatus,
+    fitReasons,
+    mq3Status,
+    mq3MgL,
+    mq3CheckedAt: sanitizeIsoTimestamp(data.mq3CheckedAt),
+    shiftHours,
+    shiftStartHr,
+    lastKeepAliveAt: sanitizeIsoTimestamp(data.lastKeepAliveAt),
+    leadOff,
+    riskFactor:
+      clampFinite(data.riskFactor, 0.8, 2.5) ?? computedProfile.riskFactor,
+    dynamicHrY:
+      clampFinite(data.dynamicHrY, 70, 160) ?? computedProfile.thresholds.hrY,
+    dynamicHrR:
+      clampFinite(data.dynamicHrR, 85, 180) ?? computedProfile.thresholds.hrR,
+    condition,
     reasons: Array.isArray(data.reasons)
       ? data.reasons.map((r) => String(r)).slice(0, 10)
       : ['Band paired — awaiting live sensor report'],
     lastReport,
     ownerUid: typeof data.ownerUid === 'string' ? data.ownerUid : undefined,
+    createdAtRaw:
+      data.createdAt && typeof data.createdAt === 'object' && 'toDate' in data.createdAt
+        ? data.createdAt
+        : undefined,
     updatedAt: timestampToIso(data.updatedAt),
+  };
+}
+
+function buildCanonicalWorkerPayload(
+  worker: WorkerRecord,
+  overrides: Partial<{
+    name: string;
+    role: string;
+    bandId: string;
+    baselineHr: number;
+    loadFactor: number;
+    age: number;
+    conditions: WorkerConditions;
+    restingBp: string;
+    mountMode: MountMode;
+    daysOnSite: number;
+    dutyZone: DutyZone;
+    readiness: WorkerReadiness;
+    gaitBalance: GaitBalanceStatus;
+    fitStatus: FitToWorkStatus;
+    fitReasons: string[];
+    mq3Status: Mq3Status;
+    mq3MgL: number | null;
+    mq3CheckedAt: string | null;
+    shiftHours: number;
+    shiftStartHr: number | null;
+    lastKeepAliveAt: string | null;
+    leadOff: boolean;
+    riskFactor: number;
+    dynamicHrY: number;
+    dynamicHrR: number;
+    condition: ConditionLevel;
+    reasons: string[];
+    lastReport: TelemetryReport | null;
+  }> = {},
+): Record<string, unknown> {
+  const safeBand = (overrides.bandId ?? worker.bandId)
+    ? sanitizeId(overrides.bandId ?? worker.bandId, 48)
+    : '';
+  const rawReasons = overrides.reasons ?? worker.reasons;
+  const safeReasons = rawReasons
+    .map((r) => sanitizeText(r, 160))
+    .filter(Boolean)
+    .slice(0, 10);
+  const rawFitReasons = overrides.fitReasons ?? worker.fitReasons;
+  const safeFitReasons = rawFitReasons
+    .map((r) => sanitizeText(r, 160))
+    .filter(Boolean)
+    .slice(0, 10);
+
+  return {
+    id: worker.id,
+    name: sanitizeText(overrides.name ?? worker.name, 80) || worker.id,
+    role: sanitizeText(overrides.role ?? worker.role, 60) || 'Site Worker',
+    bandId: safeBand,
+    baselineHr: Math.round(
+      clampFinite(overrides.baselineHr ?? worker.baselineHr, 40, 140) ?? 74,
+    ),
+    loadFactor: clampFinite(overrides.loadFactor ?? worker.loadFactor, 0.1, 2.0) ?? 0.5,
+    age: Math.round(clampFinite(overrides.age ?? worker.age, 18, 85) ?? 30),
+    conditions: normalizeConditions(overrides.conditions ?? worker.conditions),
+    restingBp: sanitizeBp(overrides.restingBp ?? worker.restingBp),
+    mountMode: overrides.mountMode ?? worker.mountMode,
+    daysOnSite: Math.round(
+      clampFinite(overrides.daysOnSite ?? worker.daysOnSite, 1, 3650) ?? 14,
+    ),
+    dutyZone: overrides.dutyZone ?? worker.dutyZone,
+    readiness: normalizeReadiness(overrides.readiness ?? worker.readiness),
+    gaitBalance: overrides.gaitBalance ?? worker.gaitBalance,
+    fitStatus: overrides.fitStatus ?? worker.fitStatus,
+    fitReasons:
+      safeFitReasons.length > 0 ? safeFitReasons : ['Fit-to-Work check initialized'],
+    mq3Status: overrides.mq3Status ?? worker.mq3Status,
+    mq3MgL: clampFinite(
+      overrides.mq3MgL !== undefined ? overrides.mq3MgL : worker.mq3MgL,
+      0,
+      2.5,
+    ),
+    mq3CheckedAt: sanitizeIsoTimestamp(
+      overrides.mq3CheckedAt !== undefined
+        ? overrides.mq3CheckedAt
+        : worker.mq3CheckedAt,
+    ),
+    shiftHours: Number(
+      (clampFinite(overrides.shiftHours ?? worker.shiftHours, 0, 24) ?? 0).toFixed(1),
+    ),
+    shiftStartHr: clampFinite(
+      overrides.shiftStartHr !== undefined
+        ? overrides.shiftStartHr
+        : worker.shiftStartHr,
+      30,
+      200,
+    ),
+    lastKeepAliveAt: sanitizeIsoTimestamp(
+      overrides.lastKeepAliveAt !== undefined
+        ? overrides.lastKeepAliveAt
+        : worker.lastKeepAliveAt,
+    ),
+    leadOff: overrides.leadOff ?? worker.leadOff,
+    riskFactor: clampFinite(overrides.riskFactor ?? worker.riskFactor, 0.8, 2.5) ?? 1.0,
+    dynamicHrY: Math.round(
+      clampFinite(overrides.dynamicHrY ?? worker.dynamicHrY, 70, 160) ?? 115,
+    ),
+    dynamicHrR: Math.round(
+      clampFinite(overrides.dynamicHrR ?? worker.dynamicHrR, 85, 180) ?? 140,
+    ),
+    condition: overrides.condition ?? worker.condition,
+    reasons: safeReasons.length > 0 ? safeReasons : ['Band paired'],
+    lastReport:
+      overrides.lastReport !== undefined ? overrides.lastReport : worker.lastReport,
+    ownerUid: worker.ownerUid || auth.currentUser?.uid || '',
+    createdAt: worker.createdAtRaw || serverTimestamp(),
+    updatedAt: serverTimestamp(),
   };
 }
 
@@ -211,7 +1041,7 @@ export function subscribeWorkers(
     q,
     (snapshot) => {
       const list = snapshot.docs
-        .map((d) => mapDocToWorker(d.data() as Record<string, unknown>))
+        .map((d) => mapDocToWorker(d.id, d.data() as Record<string, unknown>))
         .sort((a, b) => a.id.localeCompare(b.id));
       onWorkers(list);
     },
@@ -234,6 +1064,16 @@ export async function upsertWorker(
     bandId?: string;
     baselineHr?: number;
     loadFactor?: number;
+    age?: number;
+    conditions?: WorkerConditions;
+    restingBp?: string;
+    mountMode?: MountMode;
+    daysOnSite?: number;
+    dutyZone?: DutyZone;
+    readiness?: WorkerReadiness;
+    gaitBalance?: GaitBalanceStatus;
+    shiftHours?: number;
+    shiftStartHr?: number | null;
   },
   existingWorkers: WorkerRecord[],
 ): Promise<string> {
@@ -247,40 +1087,102 @@ export async function upsertWorker(
   const bandId = input.bandId ? sanitizeId(input.bandId, 48) : `JB-MK4-${id}`;
   const baselineHr = clampFinite(input.baselineHr, 40, 140) ?? 74;
   const loadFactor = clampFinite(input.loadFactor, 0.1, 2.0) ?? 0.5;
+  const age = Math.round(clampFinite(input.age, 18, 85) ?? 30);
+  const conditions = input.conditions ?? {
+    hypertension: false,
+    diabetes: false,
+    priorHeat: false,
+  };
+  const restingBp = sanitizeBp(input.restingBp);
+  const mountMode: MountMode = input.mountMode ?? 'wrist';
+  const daysOnSite = Math.round(clampFinite(input.daysOnSite, 1, 3650) ?? 14);
+  const dutyZone: DutyZone = input.dutyZone ?? 'heavy_sun';
+  const readiness = normalizeReadiness(input.readiness);
+  const gaitBalance: GaitBalanceStatus = input.gaitBalance ?? 'pending';
+  const shiftHours = Number((clampFinite(input.shiftHours, 0, 24) ?? 0).toFixed(1));
+  const shiftStartHr = clampFinite(input.shiftStartHr, 30, 200);
+
+  const existing = existingWorkers.find((w) => w.id === id);
+  const mq3Status = existing?.mq3Status ?? 'pending';
+  const dyn = computeDynamicRiskProfile({
+    age,
+    conditions,
+    restingBp,
+    daysOnSite,
+    readiness,
+    shiftHours,
+    mq3Status,
+    baselineHr,
+    loadFactor,
+  });
+
+  const fit = evaluateFitToWork({
+    workerId: id,
+    restingBp,
+    baselineHr,
+    daysOnSite,
+    dutyZone,
+    readiness,
+    gaitBalance,
+    mq3Status,
+    mq3MgL: existing?.mq3MgL ?? null,
+    shiftStartHr,
+    shiftHours,
+    leadOff: existing?.leadOff ?? false,
+    condition: existing?.lastReport ? existing.condition : 'unlinked',
+    lastReport: existing?.lastReport ?? null,
+  });
 
   const batch = writeBatch(db);
 
-  // Release conflicting bandId from any other worker owned by this user/admin
   if (bandId) {
     for (const w of existingWorkers) {
       if (w.id !== id && w.bandId.toUpperCase() === bandId) {
         const otherRef = doc(db, 'workers', w.id);
-        batch.update(otherRef, {
-          bandId: '',
-          condition: w.lastReport ? w.condition : 'unlinked',
-          reasons: w.lastReport ? w.reasons.slice(0, 10) : ['No JaanBand paired'],
-          updatedAt: serverTimestamp(),
-        });
+        batch.set(
+          otherRef,
+          buildCanonicalWorkerPayload(w, {
+            bandId: '',
+            condition: w.lastReport ? w.condition : 'unlinked',
+            reasons: w.lastReport ? w.reasons.slice(0, 10) : ['No JaanBand paired'],
+          }),
+        );
       }
     }
   }
 
-  const existing = existingWorkers.find((w) => w.id === id);
   const workerRef = doc(db, 'workers', id);
 
   if (existing) {
-    batch.update(workerRef, {
-      name,
-      role,
-      bandId,
-      baselineHr,
-      loadFactor,
-      condition: existing.lastReport ? existing.condition : 'unlinked',
-      reasons: existing.lastReport
-        ? existing.reasons.slice(0, 10)
-        : [bandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired'],
-      updatedAt: serverTimestamp(),
-    });
+    batch.set(
+      workerRef,
+      buildCanonicalWorkerPayload(existing, {
+        name,
+        role,
+        bandId,
+        baselineHr,
+        loadFactor,
+        age,
+        conditions,
+        restingBp,
+        mountMode,
+        daysOnSite,
+        dutyZone,
+        readiness,
+        gaitBalance,
+        fitStatus: fit.status,
+        fitReasons: fit.reasons,
+        shiftHours,
+        shiftStartHr,
+        riskFactor: dyn.riskFactor,
+        dynamicHrY: dyn.thresholds.hrY,
+        dynamicHrR: dyn.thresholds.hrR,
+        condition: existing.lastReport ? existing.condition : 'unlinked',
+        reasons: existing.lastReport
+          ? existing.reasons.slice(0, 10)
+          : [bandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired'],
+      }),
+    );
   } else {
     batch.set(workerRef, {
       id,
@@ -289,6 +1191,26 @@ export async function upsertWorker(
       bandId,
       baselineHr,
       loadFactor,
+      age,
+      conditions,
+      restingBp,
+      mountMode,
+      daysOnSite,
+      dutyZone,
+      readiness,
+      gaitBalance,
+      fitStatus: fit.status,
+      fitReasons: fit.reasons.map((r) => sanitizeText(r, 160)).filter(Boolean).slice(0, 10),
+      mq3Status: 'pending',
+      mq3MgL: null,
+      mq3CheckedAt: null,
+      shiftHours,
+      shiftStartHr,
+      lastKeepAliveAt: null,
+      leadOff: false,
+      riskFactor: dyn.riskFactor,
+      dynamicHrY: dyn.thresholds.hrY,
+      dynamicHrR: dyn.thresholds.hrR,
       condition: 'unlinked',
       reasons: [bandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired'],
       lastReport: null,
@@ -306,6 +1228,232 @@ export async function upsertWorker(
   return id;
 }
 
+export async function updateWorkerHealthProfile(
+  worker: WorkerRecord,
+  patch: {
+    age?: number;
+    conditions?: WorkerConditions;
+    restingBp?: string;
+    baselineHr?: number;
+    mountMode?: MountMode;
+    daysOnSite?: number;
+    dutyZone?: DutyZone;
+    readiness?: WorkerReadiness;
+    gaitBalance?: GaitBalanceStatus;
+    shiftHours?: number;
+    shiftStartHr?: number | null;
+    mq3Status?: Mq3Status;
+    mq3MgL?: number | null;
+  },
+): Promise<void> {
+  const age = Math.round(clampFinite(patch.age ?? worker.age, 18, 85) ?? 30);
+  const conditions = patch.conditions ?? worker.conditions;
+  const restingBp = sanitizeBp(patch.restingBp ?? worker.restingBp);
+  const baselineHr =
+    Math.round(clampFinite(patch.baselineHr ?? worker.baselineHr, 40, 140) ?? 74);
+  const mountMode: MountMode = patch.mountMode ?? worker.mountMode;
+  const daysOnSite = Math.round(
+    clampFinite(patch.daysOnSite ?? worker.daysOnSite, 1, 3650) ?? 14,
+  );
+  const dutyZone: DutyZone = patch.dutyZone ?? worker.dutyZone;
+  const readiness = normalizeReadiness(patch.readiness ?? worker.readiness);
+  const gaitBalance: GaitBalanceStatus = patch.gaitBalance ?? worker.gaitBalance;
+  const shiftHours = Number(
+    (clampFinite(patch.shiftHours ?? worker.shiftHours, 0, 24) ?? 0).toFixed(1),
+  );
+  const shiftStartHr =
+    patch.shiftStartHr !== undefined
+      ? clampFinite(patch.shiftStartHr, 30, 200)
+      : worker.shiftStartHr;
+  const mq3Status: Mq3Status = patch.mq3Status ?? worker.mq3Status;
+  const mq3MgL =
+    patch.mq3MgL !== undefined
+      ? clampFinite(patch.mq3MgL, 0, 2.5)
+      : worker.mq3MgL;
+
+  const dyn = computeDynamicRiskProfile({
+    age,
+    conditions,
+    restingBp,
+    daysOnSite,
+    readiness,
+    shiftHours,
+    mq3Status,
+    baselineHr,
+    loadFactor: worker.loadFactor,
+  });
+
+  let nextCondition = worker.condition;
+  let nextReasons = worker.reasons;
+  if (worker.lastReport) {
+    const reEval = evaluateCondition(worker.lastReport, {
+      workerId: worker.id,
+      age,
+      conditions,
+      restingBp,
+      daysOnSite,
+      dutyZone,
+      readiness,
+      gaitBalance,
+      mq3Status,
+      shiftStartHr,
+      shiftHours,
+      baselineHr,
+      loadFactor: worker.loadFactor,
+    });
+    nextCondition = reEval.condition;
+    nextReasons = reEval.reasons;
+  } else if (mq3Status === 'flagged') {
+    nextCondition = dutyZone === 'height' ? 'critical' : 'caution';
+    nextReasons = [
+      dutyZone === 'height'
+        ? 'Breath Alcohol Flag — barred from Height/Scaffold zone'
+        : 'Breath Alcohol Flag: High Dehydration / Impairment Risk — Assign shaded task',
+    ];
+  } else if (readiness.dizzyOrUnwell) {
+    nextCondition = 'critical';
+    nextReasons = ['Pre-shift dizziness / unwellness reported — Medical Hold'];
+  } else if (shiftStartHr !== null && shiftStartHr >= 95) {
+    nextCondition = 'caution';
+    nextReasons = [
+      `Morning resting tachycardia (${shiftStartHr} BPM) — pre-shift dehydration risk`,
+    ];
+  } else if (mq3Status === 'clear') {
+    nextCondition = 'unlinked';
+    nextReasons = [
+      worker.bandId
+        ? 'Breath check cleared — awaiting live sensor report'
+        : 'Breath check cleared — no JaanBand paired',
+    ];
+  }
+
+  const fit = evaluateFitToWork({
+    workerId: worker.id,
+    restingBp,
+    baselineHr,
+    daysOnSite,
+    dutyZone,
+    readiness,
+    gaitBalance,
+    mq3Status,
+    mq3MgL,
+    shiftStartHr,
+    shiftHours,
+    leadOff: worker.leadOff,
+    condition: nextCondition,
+    lastReport: worker.lastReport,
+  });
+
+  const payload = buildCanonicalWorkerPayload(worker, {
+    baselineHr,
+    age,
+    conditions,
+    restingBp,
+    mountMode,
+    daysOnSite,
+    dutyZone,
+    readiness,
+    gaitBalance,
+    fitStatus: fit.status,
+    fitReasons: fit.reasons,
+    mq3Status,
+    mq3MgL,
+    mq3CheckedAt:
+      patch.mq3Status !== undefined
+        ? new Date().toISOString()
+        : worker.mq3CheckedAt,
+    shiftHours,
+    shiftStartHr,
+    riskFactor: dyn.riskFactor,
+    dynamicHrY: dyn.thresholds.hrY,
+    dynamicHrR: dyn.thresholds.hrR,
+    condition: nextCondition,
+    reasons: nextReasons,
+  });
+
+  try {
+    await setDoc(doc(db, 'workers', worker.id), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `workers/${worker.id}`);
+  }
+}
+
+export async function recordKeepAliveHeartbeat(
+  worker: WorkerRecord,
+  leadOff = false,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  let nextCondition = worker.condition;
+  let nextReasons = worker.reasons;
+
+  if (leadOff) {
+    nextCondition = 'critical';
+    nextReasons = [
+      `Worker #${worker.id}: Device Disconnected / Mechanical Failure (Optical Lead-Off)`,
+    ];
+  } else if (worker.lastReport) {
+    const reEval = evaluateCondition(
+      { ...worker.lastReport, leadOff: false },
+      {
+        workerId: worker.id,
+        age: worker.age,
+        conditions: worker.conditions,
+        restingBp: worker.restingBp,
+        daysOnSite: worker.daysOnSite,
+        dutyZone: worker.dutyZone,
+        readiness: worker.readiness,
+        gaitBalance: worker.gaitBalance,
+        mq3Status: worker.mq3Status,
+        shiftStartHr: worker.shiftStartHr,
+        shiftHours: worker.shiftHours,
+        baselineHr: worker.baselineHr,
+        loadFactor: worker.loadFactor,
+      },
+    );
+    nextCondition = reEval.condition;
+    nextReasons = reEval.reasons;
+  } else {
+    nextCondition = worker.mq3Status === 'flagged' ? 'caution' : 'unlinked';
+    nextReasons = [
+      worker.mq3Status === 'flagged'
+        ? 'MQ-3 Gate Flag: High Dehydration / Impairment Risk — Assign shaded task'
+        : 'Keep-Alive verified — awaiting biometric report',
+    ];
+  }
+
+  const fit = evaluateFitToWork({
+    workerId: worker.id,
+    restingBp: worker.restingBp,
+    baselineHr: worker.baselineHr,
+    daysOnSite: worker.daysOnSite,
+    dutyZone: worker.dutyZone,
+    readiness: worker.readiness,
+    gaitBalance: worker.gaitBalance,
+    mq3Status: worker.mq3Status,
+    mq3MgL: worker.mq3MgL,
+    shiftStartHr: worker.shiftStartHr,
+    shiftHours: worker.shiftHours,
+    leadOff,
+    condition: nextCondition,
+    lastReport: worker.lastReport,
+  });
+
+  const payload = buildCanonicalWorkerPayload(worker, {
+    lastKeepAliveAt: nowIso,
+    leadOff,
+    fitStatus: fit.status,
+    fitReasons: fit.reasons,
+    condition: nextCondition,
+    reasons: nextReasons,
+  });
+
+  try {
+    await setDoc(doc(db, 'workers', worker.id), payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `workers/${worker.id}`);
+  }
+}
+
 export async function importWorkersBatch(
   user: User,
   rows: Array<{
@@ -315,6 +1463,7 @@ export async function importWorkersBatch(
     bandId?: string;
     baselineHr?: number;
     loadFactor?: number;
+    age?: number;
   }>,
   existingWorkers: WorkerRecord[],
 ): Promise<number> {
@@ -338,23 +1487,37 @@ export async function importWorkersBatch(
 
     const baselineHr = clampFinite(row.baselineHr, 40, 140) ?? 74;
     const loadFactor = clampFinite(row.loadFactor, 0.1, 2.0) ?? 0.5;
-
+    const age = Math.round(clampFinite(row.age, 18, 85) ?? 30);
     const existing = existingMap.get(id);
+    const dyn = computeDynamicRiskProfile({
+      age,
+      conditions: existing?.conditions,
+      shiftHours: existing?.shiftHours,
+      mq3Status: existing?.mq3Status,
+      baselineHr,
+    });
+
     const ref = doc(db, 'workers', id);
 
     if (existing) {
-      batch.update(ref, {
-        name,
-        role,
-        bandId,
-        baselineHr,
-        loadFactor,
-        condition: existing.lastReport ? existing.condition : 'unlinked',
-        reasons: existing.lastReport
-          ? existing.reasons.slice(0, 10)
-          : ['Band paired — awaiting live sensor report'],
-        updatedAt: serverTimestamp(),
-      });
+      batch.set(
+        ref,
+        buildCanonicalWorkerPayload(existing, {
+          name,
+          role,
+          bandId,
+          baselineHr,
+          loadFactor,
+          age,
+          riskFactor: dyn.riskFactor,
+          dynamicHrY: dyn.thresholds.hrY,
+          dynamicHrR: dyn.thresholds.hrR,
+          condition: existing.lastReport ? existing.condition : 'unlinked',
+          reasons: existing.lastReport
+            ? existing.reasons.slice(0, 10)
+            : ['Band paired — awaiting live sensor report'],
+        }),
+      );
     } else {
       batch.set(ref, {
         id,
@@ -363,6 +1526,26 @@ export async function importWorkersBatch(
         bandId,
         baselineHr,
         loadFactor,
+        age,
+        conditions: { hypertension: false, diabetes: false, priorHeat: false },
+        restingBp: '120/80',
+        mountMode: 'wrist',
+        daysOnSite: 14,
+        dutyZone: 'heavy_sun',
+        readiness: { lowSleep: false, sedatingMeds: false, dizzyOrUnwell: false },
+        gaitBalance: 'pending',
+        fitStatus: 'fit_full',
+        fitReasons: ['Cleared for Direct Sun/Heavy · BP 120/80 · Day 14 acclimatized'],
+        mq3Status: 'pending',
+        mq3MgL: null,
+        mq3CheckedAt: null,
+        shiftHours: 0,
+        shiftStartHr: null,
+        lastKeepAliveAt: null,
+        leadOff: false,
+        riskFactor: dyn.riskFactor,
+        dynamicHrY: dyn.thresholds.hrY,
+        dynamicHrR: dyn.thresholds.hrR,
         condition: 'unlinked',
         reasons: ['Band paired — awaiting live sensor report'],
         lastReport: null,
@@ -397,27 +1580,31 @@ export async function updateWorkerBandPairing(
   if (nextBandId) {
     for (const other of existingWorkers) {
       if (other.id !== worker.id && other.bandId.toUpperCase() === nextBandId) {
-        batch.update(doc(db, 'workers', other.id), {
-          bandId: '',
-          updatedAt: serverTimestamp(),
-        });
+        batch.set(
+          doc(db, 'workers', other.id),
+          buildCanonicalWorkerPayload(other, {
+            bandId: '',
+            condition: other.lastReport ? other.condition : 'unlinked',
+            reasons: other.lastReport
+              ? other.reasons.slice(0, 10)
+              : ['No JaanBand paired'],
+          }),
+        );
       }
     }
   }
 
   const ref = doc(db, 'workers', worker.id);
-  const payload: Record<string, unknown> = {
-    bandId: nextBandId,
-    updatedAt: serverTimestamp(),
-  };
-  if (!worker.lastReport) {
-    payload.condition = 'unlinked';
-    payload.reasons = [
-      nextBandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired',
-    ];
-  }
-
-  batch.update(ref, payload);
+  batch.set(
+    ref,
+    buildCanonicalWorkerPayload(worker, {
+      bandId: nextBandId,
+      condition: worker.lastReport ? worker.condition : 'unlinked',
+      reasons: worker.lastReport
+        ? worker.reasons
+        : [nextBandId ? 'Band paired — awaiting live sensor report' : 'No JaanBand paired'],
+    }),
+  );
 
   try {
     await batch.commit();
@@ -461,6 +1648,11 @@ export async function recordTelemetryReport(
     heatIndexC?: number | null;
     perfusionIndex?: number | null;
     batteryPct?: number | null;
+    tremorHz?: number | null;
+    hrrBpmDrop?: number | null;
+    shiftHours?: number | null;
+    shiftStartHr?: number | null;
+    leadOff?: boolean;
     minutesSinceBreak?: number;
     source: TelemetrySource;
   },
@@ -478,6 +1670,17 @@ export async function recordTelemetryReport(
   const heatIndexC = clampFinite(input.heatIndexC, -20, 75);
   const perfusionIndex = clampFinite(input.perfusionIndex, 0, 25);
   const batteryPct = clampFinite(input.batteryPct, 0, 100);
+  const tremorHz = clampFinite(input.tremorHz, 0, 30);
+  const hrrBpmDrop = clampFinite(input.hrrBpmDrop, 0, 80);
+  const shiftHours =
+    clampFinite(input.shiftHours ?? worker.shiftHours, 0, 24) ?? 0;
+  const shiftStartHr =
+    input.shiftStartHr !== undefined
+      ? clampFinite(input.shiftStartHr, 30, 200)
+      : worker.shiftStartHr;
+  const leadOff = Boolean(input.leadOff);
+  const mq3Flag = worker.mq3Status === 'flagged';
+
   const minutesSinceBreak = Math.round(
     clampFinite(input.minutesSinceBreak, 0, 1440) ?? 0,
   );
@@ -487,13 +1690,38 @@ export async function recordTelemetryReport(
     48,
   );
 
-  const { condition, reasons } = evaluateCondition({
-    bpm: Math.round(bpm),
-    spo2: Number(spo2.toFixed(1)),
-    skinTempC: Number(skinTempC.toFixed(2)),
-    heatIndexC: heatIndexC !== null ? Number(heatIndexC.toFixed(1)) : null,
-    minutesSinceBreak,
-  });
+  const { condition, reasons, thresholds, riskFactor } = evaluateCondition(
+    {
+      bpm: Math.round(bpm),
+      spo2: Number(spo2.toFixed(1)),
+      skinTempC: Number(skinTempC.toFixed(2)),
+      hrvMs: hrvMs !== null ? Math.round(hrvMs) : null,
+      heatIndexC: heatIndexC !== null ? Number(heatIndexC.toFixed(1)) : null,
+      perfusionIndex:
+        perfusionIndex !== null ? Number(perfusionIndex.toFixed(2)) : null,
+      batteryPct: batteryPct !== null ? Math.round(batteryPct) : null,
+      minutesSinceBreak,
+      tremorHz: tremorHz !== null ? Number(tremorHz.toFixed(1)) : null,
+      hrrBpmDrop: hrrBpmDrop !== null ? Math.round(hrrBpmDrop) : null,
+      shiftHours: Number(shiftHours.toFixed(1)),
+      leadOff,
+    },
+    {
+      workerId: worker.id,
+      age: worker.age,
+      conditions: worker.conditions,
+      restingBp: worker.restingBp,
+      daysOnSite: worker.daysOnSite,
+      dutyZone: worker.dutyZone,
+      readiness: worker.readiness,
+      gaitBalance: worker.gaitBalance,
+      mq3Status: worker.mq3Status,
+      shiftStartHr,
+      shiftHours,
+      baselineHr: worker.baselineHr,
+      loadFactor: worker.loadFactor,
+    },
+  );
 
   const reportId =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -512,14 +1740,36 @@ export async function recordTelemetryReport(
     hrvMs: hrvMs !== null ? Math.round(hrvMs) : null,
     heatIndexC: heatIndexC !== null ? Number(heatIndexC.toFixed(1)) : null,
     perfusionIndex:
-      perfusionIndex !== null ? Number(perfusionIndex.toFixed(1)) : null,
+      perfusionIndex !== null ? Number(perfusionIndex.toFixed(2)) : null,
     batteryPct: batteryPct !== null ? Math.round(batteryPct) : null,
+    tremorHz: tremorHz !== null ? Number(tremorHz.toFixed(1)) : null,
+    hrrBpmDrop: hrrBpmDrop !== null ? Math.round(hrrBpmDrop) : null,
+    shiftHours: Number(shiftHours.toFixed(1)),
+    leadOff,
+    mq3Flag,
     minutesSinceBreak,
     condition,
     reasons,
     source: input.source,
     timestamp,
   };
+
+  const fit = evaluateFitToWork({
+    workerId: worker.id,
+    restingBp: worker.restingBp,
+    baselineHr: worker.baselineHr,
+    daysOnSite: worker.daysOnSite,
+    dutyZone: worker.dutyZone,
+    readiness: worker.readiness,
+    gaitBalance: worker.gaitBalance,
+    mq3Status: worker.mq3Status,
+    mq3MgL: worker.mq3MgL,
+    shiftStartHr,
+    shiftHours,
+    leadOff,
+    condition,
+    lastReport: snapshot,
+  });
 
   const ownerUid = worker.ownerUid || user.uid;
   const batch = writeBatch(db);
@@ -532,13 +1782,24 @@ export async function recordTelemetryReport(
     createdAt: serverTimestamp(),
   });
 
-  batch.update(workerRef, {
-    bandId: resolvedBandId,
-    condition,
-    reasons,
-    lastReport: snapshot,
-    updatedAt: serverTimestamp(),
-  });
+  batch.set(
+    workerRef,
+    buildCanonicalWorkerPayload(worker, {
+      bandId: resolvedBandId,
+      condition,
+      reasons,
+      fitStatus: fit.status,
+      fitReasons: fit.reasons,
+      lastReport: snapshot,
+      lastKeepAliveAt: timestamp,
+      leadOff,
+      shiftHours: Number(shiftHours.toFixed(1)),
+      shiftStartHr,
+      riskFactor,
+      dynamicHrY: thresholds.hrY,
+      dynamicHrR: thresholds.hrR,
+    }),
+  );
 
   try {
     await batch.commit();
@@ -555,9 +1816,7 @@ export async function recordTelemetryReport(
 
 export async function touchWorkerUpdate(worker: WorkerRecord): Promise<void> {
   try {
-    await updateDoc(doc(db, 'workers', worker.id), {
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(doc(db, 'workers', worker.id), buildCanonicalWorkerPayload(worker));
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `workers/${worker.id}`);
   }
@@ -572,6 +1831,7 @@ export async function createSingleWorkerDirect(
 ): Promise<void> {
   const id = sanitizeId(workerId, 32);
   const safeBand = sanitizeId(bandId || `JB-MK4-${id}`, 48);
+  const dyn = computeDynamicRiskProfile({ age: 30 });
   try {
     await setDoc(doc(db, 'workers', id), {
       id,
@@ -580,6 +1840,26 @@ export async function createSingleWorkerDirect(
       bandId: safeBand,
       baselineHr: 74,
       loadFactor: 0.5,
+      age: 30,
+      conditions: { hypertension: false, diabetes: false, priorHeat: false },
+      restingBp: '120/80',
+      mountMode: 'wrist',
+      daysOnSite: 14,
+      dutyZone: 'heavy_sun',
+      readiness: { lowSleep: false, sedatingMeds: false, dizzyOrUnwell: false },
+      gaitBalance: 'pending',
+      fitStatus: 'fit_full',
+      fitReasons: ['Cleared for Direct Sun/Heavy · BP 120/80 · Day 14 acclimatized'],
+      mq3Status: 'pending',
+      mq3MgL: null,
+      mq3CheckedAt: null,
+      shiftHours: 0,
+      shiftStartHr: null,
+      lastKeepAliveAt: null,
+      leadOff: false,
+      riskFactor: dyn.riskFactor,
+      dynamicHrY: dyn.thresholds.hrY,
+      dynamicHrR: dyn.thresholds.hrR,
       condition: 'unlinked',
       reasons: ['Band paired — awaiting live sensor report'],
       lastReport: null,

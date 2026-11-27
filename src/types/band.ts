@@ -1,6 +1,72 @@
 export type FinishId = 'obsidian' | 'titanium' | 'gold';
 
-export type CameraPreset = 'hero' | 'sensor' | 'clasp' | 'profile';
+export type CameraPreset = 'hero' | 'sensor' | 'breath' | 'clasp' | 'profile';
+
+export type MountMode = 'wrist' | 'bicep' | 'helmet';
+
+export type Mq3Status = 'pending' | 'clear' | 'flagged';
+
+export type DutyZone = 'height' | 'heavy_sun' | 'shaded';
+
+export type GaitBalanceStatus = 'pending' | 'stable' | 'sway';
+
+export type FitToWorkStatus = 'fit_full' | 'shaded_only' | 'medical_hold';
+
+export interface DutyZoneOption {
+  id: DutyZone;
+  label: string;
+  shortLabel: string;
+  spec: string;
+}
+
+export const DUTY_ZONE_OPTIONS: DutyZoneOption[] = [
+  {
+    id: 'height',
+    label: 'Height / Scaffolding / Confined',
+    shortLabel: 'Height',
+    spec: 'Zero tolerance for tremors, sway, low sleep, or sedating meds',
+  },
+  {
+    id: 'heavy_sun',
+    label: 'Direct Radiant Sun / Heavy Load',
+    shortLabel: 'Heavy Sun',
+    spec: 'Requires heat acclimatization (7+ days), hydration PI >= 0.8%',
+  },
+  {
+    id: 'shaded',
+    label: 'Shaded / Ground Light Duty',
+    shortLabel: 'Shaded',
+    spec: 'Fallback zone for caution, MQ-3 flags, or Day 1–6 ramp-in',
+  },
+];
+
+export interface MountOption {
+  id: MountMode;
+  label: string;
+  shortLabel: string;
+  spec: string;
+}
+
+export const MOUNT_OPTIONS: MountOption[] = [
+  {
+    id: 'wrist',
+    label: 'Wrist Silicone Strap',
+    shortLabel: 'Wrist',
+    spec: '₹20 strap · IP67 conformal puck + ePTFE breath vent',
+  },
+  {
+    id: 'bicep',
+    label: 'Upper Bicep Armband',
+    shortLabel: 'Bicep',
+    spec: 'Low hammer shock · High capillary SNR',
+  },
+  {
+    id: 'helmet',
+    label: 'Hardhat Liner Clip',
+    shortLabel: 'Helmet',
+    spec: 'Temporal artery contact · Zero tool abrasion',
+  },
+];
 
 export interface FinishOption {
   id: FinishId;
@@ -74,6 +140,26 @@ export type ConditionLevel = 'unlinked' | 'normal' | 'caution' | 'critical';
 
 export type TelemetrySource = 'ble' | 'api' | 'manual';
 
+export interface WorkerConditions {
+  hypertension: boolean;
+  diabetes: boolean;
+  priorHeat: boolean;
+}
+
+export interface WorkerReadiness {
+  lowSleep: boolean;
+  sedatingMeds: boolean;
+  dizzyOrUnwell: boolean;
+}
+
+export interface FitToWorkEvaluation {
+  status: FitToWorkStatus;
+  reasons: string[];
+  bpSystolic: number;
+  bpDiastolic: number;
+  acclimatized: boolean;
+}
+
 export interface ThresholdConfig {
   hrY: number;
   hrR: number;
@@ -98,6 +184,13 @@ export const DEFAULT_THRESHOLDS: ThresholdConfig = {
   brk: 150,
 };
 
+export interface DynamicRiskProfile {
+  riskFactor: number;
+  thresholds: ThresholdConfig;
+  fatigueMultiplierActive: boolean;
+  riskTags: string[];
+}
+
 export interface TelemetryReport {
   id: string;
   workerId: string;
@@ -109,6 +202,11 @@ export interface TelemetryReport {
   heatIndexC: number | null;
   perfusionIndex: number | null;
   batteryPct: number | null;
+  tremorHz: number | null;
+  hrrBpmDrop: number | null;
+  shiftHours: number | null;
+  leadOff: boolean;
+  mq3Flag: boolean;
   minutesSinceBreak: number;
   condition: Exclude<ConditionLevel, 'unlinked'>;
   reasons: string[];
@@ -123,12 +221,40 @@ export interface WorkerRecord {
   bandId: string;
   baselineHr: number;
   loadFactor: number;
+  age: number;
+  conditions: WorkerConditions;
+  restingBp: string;
+  mountMode: MountMode;
+  daysOnSite: number;
+  dutyZone: DutyZone;
+  readiness: WorkerReadiness;
+  gaitBalance: GaitBalanceStatus;
+  fitStatus: FitToWorkStatus;
+  fitReasons: string[];
+  mq3Status: Mq3Status;
+  mq3MgL: number | null;
+  mq3CheckedAt: string | null;
+  shiftHours: number;
+  shiftStartHr: number | null;
+  lastKeepAliveAt: string | null;
+  leadOff: boolean;
+  riskFactor: number;
+  dynamicHrY: number;
+  dynamicHrR: number;
   condition: ConditionLevel;
   reasons: string[];
   lastReport: TelemetryReport | null;
   history?: TelemetryReport[];
   ownerUid?: string;
+  createdAtRaw?: unknown;
   updatedAt: string;
+}
+
+export interface KeepAliveStatus {
+  state: 'standby' | 'alive' | 'disconnected';
+  secondsElapsed: number | null;
+  secondsRemaining: number | null;
+  reason: string;
 }
 
 export interface DiagnosticCheckItem {

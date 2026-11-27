@@ -52,6 +52,28 @@ service cloud.firestore {
         && reasons[0].size() <= 160;
     }
 
+    function isValidConditionsMap(cond) {
+      return cond is map
+        && cond.keys().hasAll(['hypertension', 'diabetes', 'priorHeat'])
+        && cond.keys().hasOnly(['hypertension', 'diabetes', 'priorHeat'])
+        && cond.hypertension is bool
+        && cond.diabetes is bool
+        && cond.priorHeat is bool;
+    }
+
+    function isValidReadinessMap(readiness) {
+      return readiness is map
+        && readiness.keys().hasAll(['lowSleep', 'sedatingMeds', 'dizzyOrUnwell'])
+        && readiness.keys().hasOnly(['lowSleep', 'sedatingMeds', 'dizzyOrUnwell'])
+        && readiness.lowSleep is bool
+        && readiness.sedatingMeds is bool
+        && readiness.dizzyOrUnwell is bool;
+    }
+
+    function isValidOptionalIsoTimestamp(ts) {
+      return ts == null || (ts is string && ts.size() >= 10 && ts.size() <= 40);
+    }
+
     function isValidReportSnapshot(rep) {
       return rep is map
         && rep.keys().hasAll([
@@ -61,6 +83,7 @@ service cloud.firestore {
         && rep.keys().hasOnly([
           'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
           'hrvMs', 'heatIndexC', 'perfusionIndex', 'batteryPct',
+          'tremorHz', 'hrrBpmDrop', 'shiftHours', 'leadOff', 'mq3Flag',
           'minutesSinceBreak', 'condition', 'reasons', 'source', 'timestamp'
         ])
         && isValidId(rep.id)
@@ -73,6 +96,11 @@ service cloud.firestore {
         && (!('heatIndexC' in rep) || rep.heatIndexC == null || (rep.heatIndexC is number && rep.heatIndexC >= -20 && rep.heatIndexC <= 75))
         && (!('perfusionIndex' in rep) || rep.perfusionIndex == null || (rep.perfusionIndex is number && rep.perfusionIndex >= 0 && rep.perfusionIndex <= 25))
         && (!('batteryPct' in rep) || rep.batteryPct == null || (rep.batteryPct is number && rep.batteryPct >= 0 && rep.batteryPct <= 100))
+        && (!('tremorHz' in rep) || rep.tremorHz == null || (rep.tremorHz is number && rep.tremorHz >= 0 && rep.tremorHz <= 30))
+        && (!('hrrBpmDrop' in rep) || rep.hrrBpmDrop == null || (rep.hrrBpmDrop is number && rep.hrrBpmDrop >= 0 && rep.hrrBpmDrop <= 80))
+        && (!('shiftHours' in rep) || rep.shiftHours == null || (rep.shiftHours is number && rep.shiftHours >= 0 && rep.shiftHours <= 24))
+        && (!('leadOff' in rep) || rep.leadOff is bool)
+        && (!('mq3Flag' in rep) || rep.mq3Flag is bool)
         && rep.minutesSinceBreak is number && rep.minutesSinceBreak >= 0 && rep.minutesSinceBreak <= 1440
         && rep.condition in ['normal', 'caution', 'critical']
         && isValidReasons(rep.reasons)
@@ -87,6 +115,11 @@ service cloud.firestore {
       ])
       && data.keys().hasOnly([
         'id', 'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
+        'age', 'conditions', 'restingBp', 'mountMode',
+        'daysOnSite', 'dutyZone', 'readiness', 'gaitBalance', 'fitStatus', 'fitReasons',
+        'mq3Status', 'mq3MgL', 'mq3CheckedAt',
+        'shiftHours', 'shiftStartHr', 'lastKeepAliveAt', 'leadOff',
+        'riskFactor', 'dynamicHrY', 'dynamicHrR',
         'condition', 'reasons', 'lastReport', 'ownerUid', 'createdAt', 'updatedAt'
       ])
       && isValidId(data.id)
@@ -95,6 +128,26 @@ service cloud.firestore {
       && data.bandId is string && data.bandId.size() <= 48 && (data.bandId == '' || data.bandId.matches('^[a-zA-Z0-9_\\-]+$'))
       && data.baselineHr is number && data.baselineHr >= 40 && data.baselineHr <= 140
       && data.loadFactor is number && data.loadFactor >= 0.1 && data.loadFactor <= 2.0
+      && (!('age' in data) || (data.age is number && data.age >= 18 && data.age <= 85))
+      && (!('conditions' in data) || isValidConditionsMap(data.conditions))
+      && (!('restingBp' in data) || (data.restingBp is string && data.restingBp.size() >= 3 && data.restingBp.size() <= 16 && data.restingBp.matches('^[0-9]{2,3}/[0-9]{2,3}$')))
+      && (!('mountMode' in data) || (data.mountMode is string && data.mountMode.size() >= 5 && data.mountMode.size() <= 16 && data.mountMode in ['wrist', 'bicep', 'helmet']))
+      && (!('daysOnSite' in data) || (data.daysOnSite is number && data.daysOnSite >= 1 && data.daysOnSite <= 3650))
+      && (!('dutyZone' in data) || (data.dutyZone is string && data.dutyZone.size() >= 6 && data.dutyZone.size() <= 16 && data.dutyZone in ['height', 'heavy_sun', 'shaded']))
+      && (!('readiness' in data) || isValidReadinessMap(data.readiness))
+      && (!('gaitBalance' in data) || (data.gaitBalance is string && data.gaitBalance.size() >= 4 && data.gaitBalance.size() <= 16 && data.gaitBalance in ['pending', 'stable', 'sway']))
+      && (!('fitStatus' in data) || (data.fitStatus is string && data.fitStatus.size() >= 8 && data.fitStatus.size() <= 16 && data.fitStatus in ['fit_full', 'shaded_only', 'medical_hold']))
+      && (!('fitReasons' in data) || isValidReasons(data.fitReasons))
+      && (!('mq3Status' in data) || (data.mq3Status is string && data.mq3Status.size() >= 5 && data.mq3Status.size() <= 16 && data.mq3Status in ['pending', 'clear', 'flagged']))
+      && (!('mq3MgL' in data) || data.mq3MgL == null || (data.mq3MgL is number && data.mq3MgL >= 0 && data.mq3MgL <= 2.5))
+      && (!('mq3CheckedAt' in data) || isValidOptionalIsoTimestamp(data.mq3CheckedAt))
+      && (!('shiftHours' in data) || (data.shiftHours is number && data.shiftHours >= 0 && data.shiftHours <= 24))
+      && (!('shiftStartHr' in data) || data.shiftStartHr == null || (data.shiftStartHr is number && data.shiftStartHr >= 30 && data.shiftStartHr <= 200))
+      && (!('lastKeepAliveAt' in data) || isValidOptionalIsoTimestamp(data.lastKeepAliveAt))
+      && (!('leadOff' in data) || data.leadOff is bool)
+      && (!('riskFactor' in data) || (data.riskFactor is number && data.riskFactor >= 0.8 && data.riskFactor <= 2.5))
+      && (!('dynamicHrY' in data) || (data.dynamicHrY is number && data.dynamicHrY >= 70 && data.dynamicHrY <= 160))
+      && (!('dynamicHrR' in data) || (data.dynamicHrR is number && data.dynamicHrR >= 85 && data.dynamicHrR <= 180))
       && data.condition in ['unlinked', 'normal', 'caution', 'critical']
       && isValidReasons(data.reasons)
       && (data.lastReport == null || isValidReportSnapshot(data.lastReport))
@@ -112,6 +165,7 @@ service cloud.firestore {
       && data.keys().hasOnly([
         'id', 'workerId', 'bandId', 'bpm', 'spo2', 'skinTempC',
         'hrvMs', 'heatIndexC', 'perfusionIndex', 'batteryPct',
+        'tremorHz', 'hrrBpmDrop', 'shiftHours', 'leadOff', 'mq3Flag',
         'minutesSinceBreak', 'condition', 'reasons', 'source',
         'ownerUid', 'timestamp', 'createdAt'
       ])
@@ -126,6 +180,11 @@ service cloud.firestore {
       && (!('heatIndexC' in data) || data.heatIndexC == null || (data.heatIndexC is number && data.heatIndexC >= -20 && data.heatIndexC <= 75))
       && (!('perfusionIndex' in data) || data.perfusionIndex == null || (data.perfusionIndex is number && data.perfusionIndex >= 0 && data.perfusionIndex <= 25))
       && (!('batteryPct' in data) || data.batteryPct == null || (data.batteryPct is number && data.batteryPct >= 0 && data.batteryPct <= 100))
+      && (!('tremorHz' in data) || data.tremorHz == null || (data.tremorHz is number && data.tremorHz >= 0 && data.tremorHz <= 30))
+      && (!('hrrBpmDrop' in data) || data.hrrBpmDrop == null || (data.hrrBpmDrop is number && data.hrrBpmDrop >= 0 && data.hrrBpmDrop <= 80))
+      && (!('shiftHours' in data) || data.shiftHours == null || (data.shiftHours is number && data.shiftHours >= 0 && data.shiftHours <= 24))
+      && (!('leadOff' in data) || data.leadOff is bool)
+      && (!('mq3Flag' in data) || data.mq3Flag is bool)
       && data.minutesSinceBreak is number && data.minutesSinceBreak >= 0 && data.minutesSinceBreak <= 1440
       && data.condition in ['normal', 'caution', 'critical']
       && isValidReasons(data.reasons)
@@ -153,11 +212,11 @@ service cloud.firestore {
       allow get: if isSignedIn()
         && isEmailVerified()
         && isValidId(workerId)
-        && (isOwner(existing().ownerUid) || isAdmin());
+        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)));
 
       allow list: if isSignedIn()
         && isEmailVerified()
-        && (resource.data.ownerUid == request.auth.uid || isAdmin());
+        && (isAdmin() || resource.data.ownerUid == request.auth.uid);
 
       allow create: if isSignedIn()
         && isEmailVerified()
@@ -172,20 +231,38 @@ service cloud.firestore {
         && isEmailVerified()
         && isValidId(workerId)
         && isValidWorker(incoming())
-        && incoming().id == existing().id
-        && incoming().ownerUid == existing().ownerUid
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && (isOwner(existing().ownerUid) || isAdmin())
+        && incoming().id == workerId
+        && (!('ownerUid' in existing()) || existing().ownerUid == '' || incoming().ownerUid == existing().ownerUid || isAdmin())
         && (
-          // Action: Update worker metadata or pair/unpair JaanBand
+          ('createdAt' in existing() && existing().createdAt is timestamp && incoming().createdAt == existing().createdAt)
+          || ((!('createdAt' in existing()) || !(existing().createdAt is timestamp)) && incoming().createdAt == request.time)
+        )
+        && incoming().updatedAt == request.time
+        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)))
+        && (
+          // Action: Update worker metadata, health baseline profile, Fit-to-Work clearance, mount mode, MQ-3 gate, or band pairing
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'name', 'role', 'bandId', 'baselineHr', 'loadFactor', 'condition', 'reasons', 'updatedAt'
+            'name', 'role', 'bandId', 'baselineHr', 'loadFactor',
+            'age', 'conditions', 'restingBp', 'mountMode',
+            'daysOnSite', 'dutyZone', 'readiness', 'gaitBalance', 'fitStatus', 'fitReasons',
+            'mq3Status', 'mq3MgL', 'mq3CheckedAt',
+            'shiftHours', 'shiftStartHr',
+            'riskFactor', 'dynamicHrY', 'dynamicHrR',
+            'condition', 'reasons', 'updatedAt'
           ])
           ||
           // Action: Record latest live band telemetry state
           incoming().diff(existing()).affectedKeys().hasOnly([
-            'bandId', 'condition', 'reasons', 'lastReport', 'updatedAt'
+            'bandId', 'condition', 'reasons', 'lastReport',
+            'lastKeepAliveAt', 'leadOff', 'shiftHours', 'shiftStartHr',
+            'fitStatus', 'fitReasons',
+            'riskFactor', 'dynamicHrY', 'dynamicHrR', 'updatedAt'
+          ])
+          ||
+          // Action: Update 15s keep-alive heartbeat or mechanical lead-off disconnect state
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'lastKeepAliveAt', 'leadOff', 'fitStatus', 'fitReasons',
+            'condition', 'reasons', 'updatedAt'
           ])
           ||
           isAdmin()
@@ -194,19 +271,19 @@ service cloud.firestore {
       allow delete: if isSignedIn()
         && isEmailVerified()
         && isValidId(workerId)
-        && (isOwner(existing().ownerUid) || isAdmin());
+        && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)));
 
       match /telemetry/{reportId} {
         allow get: if isSignedIn()
           && isEmailVerified()
           && isValidId(workerId)
           && isValidId(reportId)
-          && (isOwner(existing().ownerUid) || isAdmin())
+          && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)))
           && exists(/databases/$(database)/documents/workers/$(workerId));
 
         allow list: if isSignedIn()
           && isEmailVerified()
-          && (resource.data.ownerUid == request.auth.uid || isAdmin());
+          && (isAdmin() || resource.data.ownerUid == request.auth.uid);
 
         allow create: if isSignedIn()
           && isEmailVerified()
@@ -217,7 +294,10 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && (incoming().ownerUid == request.auth.uid || isAdmin())
           && exists(/databases/$(database)/documents/workers/$(workerId))
-          && get(/databases/$(database)/documents/workers/$(workerId)).data.ownerUid == incoming().ownerUid
+          && (
+            get(/databases/$(database)/documents/workers/$(workerId)).data.ownerUid == incoming().ownerUid
+            || (!('ownerUid' in get(/databases/$(database)/documents/workers/$(workerId)).data) && isAdmin())
+          )
           && getAfter(/databases/$(database)/documents/workers/$(workerId)).data.updatedAt == request.time;
 
         allow update: if false;
@@ -226,7 +306,7 @@ service cloud.firestore {
           && isEmailVerified()
           && isValidId(workerId)
           && isValidId(reportId)
-          && (isOwner(existing().ownerUid) || isAdmin());
+          && (isAdmin() || ('ownerUid' in existing() && isOwner(existing().ownerUid)));
       }
     }
   }

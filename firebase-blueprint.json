@@ -2,7 +2,7 @@
   "entities": {
     "Worker": {
       "title": "Worker",
-      "description": "A site worker registered in JaanShield and paired to a physical JaanBand Core MK-IV biometric wristband.",
+      "description": "A site worker registered in JaanShield and paired to a modular JaanBand Core MK-IV sensor puck.",
       "type": "object",
       "properties": {
         "id": {
@@ -37,6 +37,110 @@
         "loadFactor": {
           "type": "number",
           "description": "Physical workload multiplier (0.1-2.0)"
+        },
+        "age": {
+          "type": "number",
+          "description": "Worker age in years (18-85); 45+ increases dynamic cardiovascular weighting"
+        },
+        "conditions": {
+          "type": "object",
+          "description": "Pre-existing health history flags (hypertension, diabetes, priorHeat)"
+        },
+        "restingBp": {
+          "type": "string",
+          "description": "Resting blood pressure recorded during 1-minute onboarding check (e.g. 120/80)",
+          "minLength": 3,
+          "maxLength": 16,
+          "pattern": "^[0-9]{2,3}/[0-9]{2,3}$"
+        },
+        "mountMode": {
+          "type": "string",
+          "description": "Modular puck mounting form factor",
+          "enum": ["wrist", "bicep", "helmet"],
+          "minLength": 5,
+          "maxLength": 16
+        },
+        "daysOnSite": {
+          "type": "number",
+          "description": "Cumulative days worked on hot site (1-3650); <7 days triggers unacclimatized heat protection"
+        },
+        "dutyZone": {
+          "type": "string",
+          "description": "Assigned job hazard tier",
+          "enum": ["height", "heavy_sun", "shaded"],
+          "minLength": 6,
+          "maxLength": 16
+        },
+        "readiness": {
+          "type": "object",
+          "description": "Morning fit-for-duty self-report flags (lowSleep, sedatingMeds, dizzyOrUnwell)"
+        },
+        "gaitBalance": {
+          "type": "string",
+          "description": "5-second ADXL345 IMU morning stand balance check",
+          "enum": ["pending", "stable", "sway"],
+          "minLength": 4,
+          "maxLength": 16
+        },
+        "fitStatus": {
+          "type": "string",
+          "description": "Computed Fit-to-Work site clearance tier",
+          "enum": ["fit_full", "shaded_only", "medical_hold"],
+          "minLength": 8,
+          "maxLength": 16
+        },
+        "fitReasons": {
+          "type": "array",
+          "description": "Fit-to-Work clearance explanations (1-10 items)"
+        },
+        "mq3Status": {
+          "type": "string",
+          "description": "Tier 1 morning attendance gate MQ-3 breath alcohol status",
+          "enum": ["pending", "clear", "flagged"],
+          "minLength": 5,
+          "maxLength": 16
+        },
+        "mq3MgL": {
+          "type": "number",
+          "description": "Morning MQ-3 alcohol sensor reading in mg/L (0-2.5) or null"
+        },
+        "mq3CheckedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 timestamp of morning MQ-3 gate screening or null",
+          "minLength": 10,
+          "maxLength": 40
+        },
+        "shiftHours": {
+          "type": "number",
+          "description": "Continuous hours on shift (0-24); >=4h increases fatigue sensitivity"
+        },
+        "shiftStartHr": {
+          "type": "number",
+          "description": "8 AM shift-start resting heart rate (30-200) or null; 95-110+ flags tachycardia"
+        },
+        "lastKeepAliveAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 timestamp of most recent 15-second Keep-Alive packet or null",
+          "minLength": 10,
+          "maxLength": 40
+        },
+        "leadOff": {
+          "type": "boolean",
+          "description": "True when optical skin contact is broken or band suffers mechanical disconnect"
+        },
+        "riskFactor": {
+          "type": "number",
+          "description": "Computed individualized dynamic risk multiplier Rf (0.8-2.5)"
+        },
+        "dynamicHrY": {
+          "type": "number",
+          "description": "Individualized caution heart-rate threshold in BPM (70-160)"
+        },
+        "dynamicHrR": {
+          "type": "number",
+          "description": "Individualized critical heart-rate threshold in BPM (85-180)"
         },
         "condition": {
           "type": "string",
@@ -85,7 +189,7 @@
     },
     "TelemetryReport": {
       "title": "TelemetryReport",
-      "description": "A single real-time biometric packet transmitted from a paired JaanBand Core MK-IV.",
+      "description": "A single real-time biometric packet transmitted from a paired JaanBand Core MK-IV puck.",
       "type": "object",
       "properties": {
         "id": {
@@ -123,7 +227,7 @@
         },
         "hrvMs": {
           "type": "number",
-          "description": "Heart rate variability in milliseconds (0-300) or null"
+          "description": "RMSSD heart rate variability in milliseconds (0-300) or null"
         },
         "heatIndexC": {
           "type": "number",
@@ -136,6 +240,26 @@
         "batteryPct": {
           "type": "number",
           "description": "Band battery charge percentage (0-100) or null"
+        },
+        "tremorHz": {
+          "type": "number",
+          "description": "Onboard accelerometer dominant tremor frequency in Hz (0-30) or null; 6-12Hz flags withdrawal"
+        },
+        "hrrBpmDrop": {
+          "type": "number",
+          "description": "5-minute break heart rate recovery drop in BPM (0-80) or null; <12 flags depletion"
+        },
+        "shiftHours": {
+          "type": "number",
+          "description": "Continuous shift duration in hours (0-24) or null"
+        },
+        "leadOff": {
+          "type": "boolean",
+          "description": "True if optical lead-off disconnect detected during packet"
+        },
+        "mq3Flag": {
+          "type": "boolean",
+          "description": "True if morning MQ-3 gate flagged high dehydration/impairment risk"
         },
         "minutesSinceBreak": {
           "type": "number",
@@ -214,13 +338,13 @@
       "schema": {
         "$ref": "#/entities/Worker"
       },
-      "description": "Primary worker roster and active JaanBand pairing + latest biometric state."
+      "description": "Primary worker roster, health history profile, mount configuration, MQ-3 gate screening, keep-alive failsafe, and active biometric snapshot."
     },
     "/workers/{workerId}/telemetry/{reportId}": {
       "schema": {
         "$ref": "#/entities/TelemetryReport"
       },
-      "description": "Append-only time-series biometric packets emitted by each worker's paired JaanBand."
+      "description": "Append-only time-series biometric packets emitted by each worker's paired JaanBand puck."
     },
     "/admins/{adminId}": {
       "schema": {
